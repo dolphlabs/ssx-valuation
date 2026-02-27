@@ -7,4 +7,6 @@ edition = "2024"
 rust_decimal = { workspace = true }
 rust_decimal_macros = { workspace = true }
 serde = { workspace = true }
+rand = { workspace = true }
+rand_distr = { workspace = true }
 tracing = "0.1"
