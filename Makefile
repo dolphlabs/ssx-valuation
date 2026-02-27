@@ -16,5 +16,8 @@ test:
 seed:
 	cargo run
 
+visualize:
+	python3 visualize.py
+
 clean:
 	cargo clean

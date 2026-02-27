@@ -39,11 +39,11 @@ fn main() {
     let events = ssx_valuation::setup::generate_mock_season(4);
     println!("Generated {} events.", events.len());
 
-    // Choose a pair to monitor (e.g., Man City vs Arsenal)
-    let city_id = 1;
-    let arsenal_id = 4;
+    // Choose a pair to monitor: Liverpool (5) vs Wolves (11)
+    let team1_id = 5;
+    let team2_id = 11;
     
-    let mut last_rate = engine.get_club_pair_exchange_rate(city_id, arsenal_id);
+    let mut last_rate = engine.get_club_pair_exchange_rate(team1_id, team2_id);
     if last_rate.is_zero() {
         last_rate = dec!(1.0); // Fallback
     }
@@ -54,13 +54,21 @@ fn main() {
     let mut goal_count = 0;
     let start_instant = std::time::Instant::now();
 
-    let time_series = replay.replay(events, city_id, arsenal_id);
+    let time_series = replay.replay(events, team1_id, team2_id);
     
     let total_duration = start_instant.elapsed();
     let avg_latency_us = total_duration.as_micros() as f64 / time_series.len() as f64;
 
+    // Export to CSV
+    use std::fs::File;
+    use std::io::Write;
+    let mut file = File::create("simulation_results.csv").expect("Unable to create file");
+    writeln!(file, "timestamp,exchange_rate").expect("Unable to write header");
+
     for (ts, rate) in &time_series {
-        // Simple Jitter heuristic: if it's a goal (implied by rate change), measure % change
+        writeln!(file, "{},{}", ts, rate).expect("Unable to write data");
+
+        // Simple Jitter heuristic
         let diff = (*rate - last_rate).abs();
         if diff > Decimal::ZERO {
             let jitter = (diff / last_rate) * dec!(100.0);
@@ -75,8 +83,9 @@ fn main() {
         println!("Exchange Rate Jitter: {:.2}% per event (Target: < 5%)", total_jitter / Decimal::from(goal_count));
     }
     println!("Processing Latency: {:.2}us per event (Target: < 1000us)", avg_latency_us);
+    println!("Data exported to simulation_results.csv");
     
     // WhistleEnd Convergence check
-    let final_vol = engine.player_states.get(&1005).map(|p| p.volatility_factor).unwrap_or(Decimal::ONE);
-    println!("WhistleEnd Convergence (V_fact of Haaland): {} (Target: 1.0)", final_vol);
+    let final_vol = engine.player_states.get(&1203).map(|p| p.volatility_factor).unwrap_or(Decimal::ONE);
+    println!("WhistleEnd Convergence (V_fact of Salah): {} (Target: 1.0)", final_vol);
 }
