@@ -4,10 +4,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
 pub mod replay;
+pub mod setup;
 
 // --- Core Valuation Types ---
 
 #[derive(Debug, Clone)]
+#[repr(C, u8)]
 pub enum MatchEvent {
     Goal { team_id: u32, opponent_id: u32, player_id: u32, minute: u32 },
     YellowCard { team_id: u32, opponent_id: u32, player_id: u32 },
@@ -62,6 +64,31 @@ pub struct ClubState {
     pub top_oppositions: BTreeMap<u32, Decimal>,
     pub rivals: Vec<(u32, Decimal)>,
     pub player_ids: Vec<u32>,
+}
+
+impl ClubState {
+    pub fn new(id: u32) -> Self {
+        Self {
+            id,
+            intrinsic_value: dec!(100.0), // Default value
+            last_match_update: 0,
+            top_oppositions: BTreeMap::new(),
+            rivals: Vec::new(),
+            player_ids: Vec::new(),
+        }
+    }
+
+    pub fn set_rival_factor(&mut self, opponent_id: u32, factor: Decimal) {
+        if let Some(pos) = self.rivals.iter().position(|(id, _)| *id == opponent_id) {
+            self.rivals[pos].1 = factor;
+        } else {
+            self.rivals.push((opponent_id, factor));
+        }
+    }
+
+    pub fn set_opposition_factor(&mut self, opponent_id: u32, factor: Decimal) {
+        self.top_oppositions.insert(opponent_id, factor);
+    }
 }
 
 // --- Engine Implementation ---
