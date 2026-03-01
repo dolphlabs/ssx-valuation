@@ -28,6 +28,7 @@ pub enum MatchEvent {
     RedCard { team_id: ClubId, opponent_id: ClubId, player_id: PlayerId },
     Injury { player_id: PlayerId, severity: u32 },
     WhistleEnd { team_a_id: ClubId, team_b_id: ClubId },
+    Heartbeat { team_id: ClubId },
 }
 
 // --- Position Modeling ---
@@ -265,6 +266,15 @@ impl ValuationEngine {
                             self.notify(EngineUpdate::Player { id: pid, state: player.clone() });
                         }
                     }
+                }
+            }
+            MatchEvent::Heartbeat { team_id } => {
+                if let Some(mut club) = self.club_states.get_mut(&team_id) {
+                    club.last_match_update = current_ts;
+                    // Apply a tiny bit of random drift to make it look alive
+                    let drift = (dec!(0.0001) * (Decimal::from(current_ts % 100) - dec!(50))) / dec!(100);
+                    club.intrinsic_value += drift;
+                    self.notify(EngineUpdate::Club { id: team_id, state: club.clone() });
                 }
             }
         }
