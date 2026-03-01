@@ -1,4 +1,4 @@
-use crate::{MatchEvent};
+use crate::{MatchEvent, ClubId, PlayerId};
 use rand::seq::SliceRandom;
 use rand::{Rng, thread_rng};
 use rand_distr::{Distribution, Poisson};
@@ -9,17 +9,12 @@ pub fn generate_mock_season(duration_weeks: u32) -> Vec<(u64, MatchEvent)> {
     let seconds_per_week = 604_800;
     let current_ts = 1000; // Starting timestamp
 
-    let club_ids: Vec<u32> = (1..=20).collect();
-    // Assuming each club has players with IDs like 1000 + (club_id-1)*50 + i
-    // In our seeding:
-    // Man City (1): 1001-1020
-    // Man United (2): 1051-1071
-    // ...
-    // Southampton (20): 1951-1970
+    let club_ids: Vec<ClubId> = (1..=20).map(ClubId).collect();
+    // Assuming each club has players with IDs like 1000 + (club_id.0-1)*50 + i
     
-    let get_player_ids = |club_id: u32| -> Vec<u32> {
-        let base = 1000 + (club_id - 1) * 50;
-        (1..=20).map(|i| base + i).collect()
+    let get_player_ids = |club_id: ClubId| -> Vec<PlayerId> {
+        let base = 1000 + (club_id.0 - 1) * 50;
+        (1..=20).map(|i| PlayerId(base + i)).collect()
     };
 
     let poisson = Poisson::new(1.4).unwrap(); // Avg 1.4 per team => 2.8 per match

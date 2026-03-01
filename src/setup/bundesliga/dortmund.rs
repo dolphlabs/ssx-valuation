@@ -1,16 +1,16 @@
-use crate::{ValuationEngine, ClubState, PlayerValues, Position};
+use crate::{ValuationEngine, ClubState, PlayerValues, Position, ClubId, PlayerId};
 use rust_decimal_macros::dec;
 
 pub fn seed(engine: &mut ValuationEngine) {
-    let club_id = 4005;
+    let club_id = ClubId(4005);
     let mut club = ClubState::new(club_id);
     club.intrinsic_value = dec!(920.00); // Champions League finalists
     
-    club.set_rival_factor(4002, dec!(1.5)); // Bayern Munich (Der Klassiker)
-    club.set_rival_factor(4012, dec!(1.2)); // Wolfsburg? let's use Schalke if they were in BL, but they aren't.
+    club.set_rival_factor(ClubId(4002), dec!(1.5)); // Bayern Munich (Der Klassiker)
+    club.set_rival_factor(ClubId(4012), dec!(1.2)); // Wolfsburg? let's use Schalke if they were in BL, but they aren't.
 
     engine.club_states.insert(club_id, club);
-    engine.names.insert(club_id, "Borussia Dortmund".to_string());
+    engine.names.insert(club_id.0, "Borussia Dortmund".to_string());
 
     let players = vec![
         (40201, "Gregor Kobel", Position::GK, dec!(75.0), false),
@@ -37,7 +37,7 @@ pub fn seed(engine: &mut ValuationEngine) {
     ];
 
     for (id, name, pos, val, captain) in players {
-        engine.player_states.insert(id, PlayerValues {
+        engine.player_states.insert(PlayerId(id), PlayerValues {
             team_id: club_id,
             intrinsic_value: val,
             form_weight: dec!(1.0),
@@ -49,7 +49,7 @@ pub fn seed(engine: &mut ValuationEngine) {
         });
         engine.names.insert(id, name.to_string());
         if let Some(mut c) = engine.club_states.get_mut(&club_id) {
-            c.player_ids.push(id);
+            c.player_ids.push(PlayerId(id));
         }
     }
 }

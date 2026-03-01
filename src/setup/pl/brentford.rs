@@ -1,16 +1,16 @@
-use crate::{ValuationEngine, ClubState, PlayerValues, Position};
+use crate::{ValuationEngine, ClubState, PlayerValues, Position, ClubId, PlayerId};
 use rust_decimal_macros::dec;
 
 pub fn seed(engine: &mut ValuationEngine) {
-    let club_id = 15;
+    let club_id = ClubId(15);
     let mut club = ClubState::new(club_id);
-    engine.names.insert(club_id, "Brentford".to_string());
+    engine.names.insert(club_id.0, "Brentford".to_string());
     
     club.intrinsic_value = dec!(480.00);
     
     // Rivals: Fulham (12), Chelsea (6)
-    club.set_rival_factor(12, dec!(1.3));
-    club.set_rival_factor(6, dec!(1.2));
+    club.set_rival_factor(ClubId(12), dec!(1.3));
+    club.set_rival_factor(ClubId(6), dec!(1.2));
 
     engine.club_states.insert(club_id, club);
 
@@ -39,7 +39,7 @@ pub fn seed(engine: &mut ValuationEngine) {
 
     for (id, name, pos, val, captain) in players {
         engine.names.insert(id, name.to_string());
-        engine.player_states.insert(id, PlayerValues {
+        engine.player_states.insert(PlayerId(id), PlayerValues {
             team_id: club_id,
             intrinsic_value: val,
             form_weight: dec!(1.0),

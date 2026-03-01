@@ -8,17 +8,26 @@ use tokio::sync::mpsc;
 
 pub mod replay;
 pub mod setup;
+pub mod oracle;
+
+// --- ID Newtypes ---
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
+pub struct ClubId(pub u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
+pub struct PlayerId(pub u32);
 
 // --- Core Valuation Types ---
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[repr(C, u8)]
 pub enum MatchEvent {
-    Goal { team_id: u32, opponent_id: u32, player_id: u32, minute: u32 },
-    YellowCard { team_id: u32, opponent_id: u32, player_id: u32 },
-    RedCard { team_id: u32, opponent_id: u32, player_id: u32 },
-    Injury { player_id: u32, severity: u32 },
-    WhistleEnd { team_a_id: u32, team_b_id: u32 },
+    Goal { team_id: ClubId, opponent_id: ClubId, player_id: PlayerId, minute: u32 },
+    YellowCard { team_id: ClubId, opponent_id: ClubId, player_id: PlayerId },
+    RedCard { team_id: ClubId, opponent_id: ClubId, player_id: PlayerId },
+    Injury { player_id: PlayerId, severity: u32 },
+    WhistleEnd { team_a_id: ClubId, team_b_id: ClubId },
 }
 
 // --- Position Modeling ---
@@ -50,7 +59,7 @@ impl Position {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlayerValues {
-    pub team_id: u32,
+    pub team_id: ClubId,
     pub intrinsic_value: Decimal,
     pub form_weight: Decimal,
     pub sentiment_score: Decimal,
@@ -62,16 +71,16 @@ pub struct PlayerValues {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClubState {
-    pub id: u32,
+    pub id: ClubId,
     pub intrinsic_value: Decimal,
     pub last_match_update: u64,
-    pub top_oppositions: BTreeMap<u32, Decimal>,
-    pub rivals: Vec<(u32, Decimal)>,
-    pub player_ids: Vec<u32>,
+    pub top_oppositions: BTreeMap<ClubId, Decimal>,
+    pub rivals: Vec<(ClubId, Decimal)>,
+    pub player_ids: Vec<PlayerId>,
 }
 
 impl ClubState {
-    pub fn new(id: u32) -> Self {
+    pub fn new(id: ClubId) -> Self {
         Self {
             id,
             intrinsic_value: dec!(100.0),
@@ -82,7 +91,7 @@ impl ClubState {
         }
     }
 
-    pub fn set_rival_factor(&mut self, opponent_id: u32, factor: Decimal) {
+    pub fn set_rival_factor(&mut self, opponent_id: ClubId, factor: Decimal) {
         if let Some(pos) = self.rivals.iter().position(|(id, _)| *id == opponent_id) {
             self.rivals[pos].1 = factor;
         } else {
@@ -90,7 +99,7 @@ impl ClubState {
         }
     }
 
-    pub fn set_opposition_factor(&mut self, opponent_id: u32, factor: Decimal) {
+    pub fn set_opposition_factor(&mut self, opponent_id: ClubId, factor: Decimal) {
         self.top_oppositions.insert(opponent_id, factor);
     }
 }
@@ -99,17 +108,17 @@ impl ClubState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum EngineUpdate {
-    Player { id: u32, state: PlayerValues },
-    Club { id: u32, state: ClubState },
+    Player { id: PlayerId, state: PlayerValues },
+    Club { id: ClubId, state: ClubState },
     Event { event: MatchEvent, ts: u64 },
 }
 
 // --- Engine Implementation ---
 
 pub struct ValuationEngine {
-    pub player_states: Arc<DashMap<u32, PlayerValues>>,
-    pub club_states: Arc<DashMap<u32, ClubState>>,
-    pub names: Arc<DashMap<u32, String>>,
+    pub player_states: Arc<DashMap<PlayerId, PlayerValues>>,
+    pub club_states: Arc<DashMap<ClubId, ClubState>>,
+    pub names: Arc<DashMap<u32, String>>, // Keep name lookup as u32 for now, or consider generic
     pub is_transfer_window: std::sync::atomic::AtomicBool,
     pub update_tx: Option<mpsc::UnboundedSender<EngineUpdate>>,
 }
@@ -156,7 +165,7 @@ impl ValuationEngine {
         }
     }
 
-    pub fn get_club_pair_exchange_rate(&self, base_id: u32, quote_id: u32) -> Decimal {
+    pub fn get_club_pair_exchange_rate(&self, base_id: ClubId, quote_id: ClubId) -> Decimal {
         let v_base = self.club_states.get(&base_id).map(|c| c.intrinsic_value).unwrap_or(dec!(0));
         let v_quote = self.club_states.get(&quote_id).map(|c| c.intrinsic_value).unwrap_or(dec!(1));
         if v_quote.is_zero() { dec!(0) } else { v_base / v_quote }
@@ -221,7 +230,7 @@ impl ValuationEngine {
                         self.notify(EngineUpdate::Club { id: team_id, state: club.clone() });
                     }
                     
-                    let pids: Vec<u32> = self.player_states.iter()
+                        let pids: Vec<PlayerId> = self.player_states.iter()
                         .filter(|entry| entry.value().team_id == team_id)
                         .map(|entry| *entry.key())
                         .collect();
@@ -252,7 +261,7 @@ impl ValuationEngine {
         }
     }
 
-    fn get_rivalry_multiplier(&self, team_id: u32, opponent_id: u32) -> Decimal {
+    fn get_rivalry_multiplier(&self, team_id: ClubId, opponent_id: ClubId) -> Decimal {
         self.club_states.get(&team_id)
             .and_then(|club| {
                 club.rivals.iter()

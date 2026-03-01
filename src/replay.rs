@@ -1,4 +1,4 @@
-use crate::{ValuationEngine, MatchEvent};
+use crate::{ValuationEngine, MatchEvent, ClubId};
 use rust_decimal::Decimal;
 use tracing::{info, info_span, warn};
 use std::time::Instant;
@@ -16,8 +16,8 @@ impl<'a> HistoricalReplay<'a> {
     pub fn replay(
         &mut self,
         mut events: Vec<(u64, MatchEvent)>,
-        base_id: u32,
-        quote_id: u32,
+        base_id: ClubId,
+        quote_id: ClubId,
     ) -> Vec<(u64, Decimal)> {
         // Ensure chronological order
         events.sort_by_key(|(ts, _)| *ts);
@@ -46,10 +46,10 @@ impl<'a> HistoricalReplay<'a> {
     }
 
     /// Verifies the final calculated intrinsic value against a target 'Point Score'.
-    pub fn verify_calibration(&self, club_id: u32, target_score: Decimal) -> bool {
+    pub fn verify_calibration(&self, club_id: ClubId, target_score: Decimal) -> bool {
         if let Some(club) = self.engine.club_states.get(&club_id) {
             let result = club.intrinsic_value;
-            info!("Calibration check for club {}: calculated={}, target={}", club_id, result, target_score);
+            info!("Calibration check for club {}: calculated={}, target={}", club_id.0, result, target_score);
             // Allow for small floating point / decimal rounding differences if any, 
             // though Decimal should be exact.
             result == target_score
@@ -69,16 +69,20 @@ mod tests {
     #[test]
     fn test_historical_replay_exchange_rate() {
         let mut engine = ValuationEngine::new();
-        engine.club_states.insert(1, ClubState {
-            id: 1,
+        let club1 = ClubId(1);
+        let club2 = ClubId(2);
+        let player0 = PlayerId(0);
+
+        engine.club_states.insert(club1, ClubState {
+            id: club1,
             intrinsic_value: dec!(100.0),
             last_match_update: 0,
             top_oppositions: BTreeMap::new(),
             rivals: vec![],
             player_ids: vec![],
         });
-        engine.club_states.insert(2, ClubState {
-            id: 2,
+        engine.club_states.insert(club2, ClubState {
+            id: club2,
             intrinsic_value: dec!(50.0),
             last_match_update: 0,
             top_oppositions: BTreeMap::new(),
@@ -87,12 +91,12 @@ mod tests {
         });
 
         let events = vec![
-            (10, MatchEvent::Goal { team_id: 1, opponent_id: 2, player_id: 0, minute: 10 }),
-            (20, MatchEvent::Goal { team_id: 1, opponent_id: 2, player_id: 0, minute: 20 }),
+            (10, MatchEvent::Goal { team_id: club1, opponent_id: club2, player_id: player0, minute: 10 }),
+            (20, MatchEvent::Goal { team_id: club1, opponent_id: club2, player_id: player0, minute: 20 }),
         ];
 
         let mut replay = HistoricalReplay::new(&mut engine);
-        let ts = replay.replay(events, 1, 2);
+        let ts = replay.replay(events, club1, club2);
 
         assert_eq!(ts.len(), 2);
         // Initial 100/50 = 2.0

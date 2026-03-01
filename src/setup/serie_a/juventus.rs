@@ -1,17 +1,17 @@
-use crate::{ValuationEngine, ClubState, PlayerValues, Position};
+use crate::{ValuationEngine, ClubState, PlayerValues, Position, ClubId, PlayerId};
 use rust_decimal_macros::dec;
 
 pub fn seed(engine: &mut ValuationEngine) {
-    let club_id = 3003;
+    let club_id = ClubId(3003);
     let mut club = ClubState::new(club_id);
     club.intrinsic_value = dec!(1000.00); 
     
-     club.set_rival_factor(3001, dec!(1.4)); // Inter (Derby d'Italia)
-    club.set_rival_factor(3002, dec!(1.3)); // AC Milan
-    club.set_rival_factor(3009, dec!(1.5)); // Torino (Derby della Mole)
+     club.set_rival_factor(ClubId(3001), dec!(1.4)); // Inter (Derby d'Italia)
+    club.set_rival_factor(ClubId(3002), dec!(1.3)); // AC Milan
+    club.set_rival_factor(ClubId(3009), dec!(1.5)); // Torino (Derby della Mole)
 
     engine.club_states.insert(club_id, club);
-    engine.names.insert(club_id, "Juventus".to_string());
+    engine.names.insert(club_id.0, "Juventus".to_string());
 
     let players = vec![
         (30101, "Michele Di Gregorio", Position::GK, dec!(45.0), false),
@@ -38,7 +38,7 @@ pub fn seed(engine: &mut ValuationEngine) {
     ];
 
     for (id, name, pos, val, captain) in players {
-        engine.player_states.insert(id, PlayerValues {
+        engine.player_states.insert(PlayerId(id), PlayerValues {
             team_id: club_id,
             intrinsic_value: val,
             form_weight: dec!(1.0),
@@ -50,7 +50,7 @@ pub fn seed(engine: &mut ValuationEngine) {
         });
         engine.names.insert(id, name.to_string());
         if let Some(mut c) = engine.club_states.get_mut(&club_id) {
-            c.player_ids.push(id);
+            c.player_ids.push(PlayerId(id));
         }
     }
 }
