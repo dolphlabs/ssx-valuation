@@ -111,6 +111,15 @@ pub enum EngineUpdate {
     Player { id: PlayerId, state: PlayerValues },
     Club { id: ClubId, state: ClubState },
     Event { event: MatchEvent, ts: u64 },
+    CandleUpdate { 
+        base_id: ClubId, 
+        quote_id: ClubId, 
+        open: f64, 
+        high: f64, 
+        low: f64, 
+        close: f64, 
+        ts: u64 
+    },
 }
 
 // --- Engine Implementation ---
