@@ -1,4 +1,4 @@
-use crate::{MatchEvent, Position};
+use crate::{MatchEvent};
 use rand::seq::SliceRandom;
 use rand::{Rng, thread_rng};
 use rand_distr::{Distribution, Poisson};
@@ -7,7 +7,7 @@ pub fn generate_mock_season(duration_weeks: u32) -> Vec<(u64, MatchEvent)> {
     let mut rng = thread_rng();
     let mut events = Vec::new();
     let seconds_per_week = 604_800;
-    let mut current_ts = 1000; // Starting timestamp
+    let current_ts = 1000; // Starting timestamp
 
     let club_ids: Vec<u32> = (1..=20).collect();
     // Assuming each club has players with IDs like 1000 + (club_id-1)*50 + i
@@ -42,7 +42,7 @@ pub fn generate_mock_season(duration_weeks: u32) -> Vec<(u64, MatchEvent)> {
             let players_b = get_player_ids(team_b_id);
 
             // Team A Goals
-            for i in 0..goals_a {
+            for _ in 0..goals_a {
                 let pid = *players_a.choose(&mut rng).unwrap();
                 let minute = rng.gen_range(1..90);
                 events.push((match_ts + (minute as u64 * 60), MatchEvent::Goal {
@@ -54,7 +54,7 @@ pub fn generate_mock_season(duration_weeks: u32) -> Vec<(u64, MatchEvent)> {
             }
 
             // Team B Goals
-            for i in 0..goals_b {
+            for _ in 0..goals_b {
                 let pid = *players_b.choose(&mut rng).unwrap();
                 let minute = rng.gen_range(1..90);
                 events.push((match_ts + (minute as u64 * 60), MatchEvent::Goal {

@@ -8,13 +8,13 @@ build:
 	cargo build
 
 run:
-	cargo run
+	cargo run -p ssx-node
 
 test:
 	cargo test
 
 seed:
-	cargo run
+	cargo run -p ssx-node
 
 visualize:
 	python3 visualize.py

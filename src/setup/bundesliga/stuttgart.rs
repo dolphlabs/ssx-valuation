@@ -45,7 +45,7 @@ pub fn seed(engine: &mut ValuationEngine) {
             is_captain: captain,
         });
         engine.names.insert(id, name.to_string());
-        if let Some(c) = engine.club_states.get_mut(&club_id) {
+        if let Some(mut c) = engine.club_states.get_mut(&club_id) {
             c.player_ids.push(id);
         }
     }
