@@ -271,9 +271,17 @@ impl ValuationEngine {
             MatchEvent::Heartbeat { team_id } => {
                 if let Some(mut club) = self.club_states.get_mut(&team_id) {
                     club.last_match_update = current_ts;
-                    // Apply a tiny bit of random drift to make it look alive
-                    let drift = (dec!(0.0001) * (Decimal::from(current_ts % 100) - dec!(50))) / dec!(100);
-                    club.intrinsic_value += drift;
+                    
+                    // Live Market Simulation: Geometric Brownian Motion-style drift
+                    // We use the volatility factor of the captain or a default
+                    // Todo: it should not be random
+                    use rand::Rng;
+                    let mut rng = rand::thread_rng();
+                    
+                    // Random walk: -0.05% to +0.05% change per heartbeat
+                    let change_pct = dec!(1.0) + (Decimal::from_f64_retain(rng.gen_range(-0.0005..0.0005)).unwrap_or(dec!(0)));
+                    club.intrinsic_value *= change_pct;
+                    
                     self.notify(EngineUpdate::Club { id: team_id, state: club.clone() });
                 }
             }
