@@ -9,6 +9,7 @@ use tokio::sync::mpsc;
 pub mod replay;
 pub mod setup;
 pub mod oracle;
+pub mod env_config;
 
 // --- ID Newtypes ---
 

@@ -62,7 +62,7 @@ impl<'a> HistoricalReplay<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ClubState, Position};
+    use crate::{ClubState, PlayerId, Position};
     use rust_decimal_macros::dec;
     use std::collections::BTreeMap;
 

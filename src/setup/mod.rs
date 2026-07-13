@@ -6,6 +6,9 @@ pub mod serie_a;
 pub mod bundesliga;
 pub mod ligue_1;
 pub mod generator;
+pub mod roster;
+
+pub use roster::{ClubMeta, ROSTER};
 
 pub fn seed_big_five_leagues(engine: &mut ValuationEngine) {
     pl::seed(engine);
