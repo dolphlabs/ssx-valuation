@@ -10,6 +10,7 @@ pub mod replay;
 pub mod setup;
 pub mod oracle;
 pub mod env_config;
+pub mod trading;
 
 // --- ID Newtypes ---
 

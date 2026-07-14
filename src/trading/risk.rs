@@ -1,0 +1,120 @@
+use rust_decimal::Decimal;
+
+/// Unrealized PnL in USD for a position. `size_signed` is base-club units
+/// (positive = long, negative = short); `entry_price` is quote-per-base at
+/// fill time; `base_intrinsic_now`/`quote_intrinsic_now` are each club's
+/// *current* `ClubState::intrinsic_value`, which this codebase already
+/// treats as an absolute USD-denominated numéraire (starting at $100, see
+/// `ClubState::new`).
+///
+/// This deliberately always uses the independently-computed index price
+/// (derived from each club's own intrinsic_value), never a vAMM pool's own
+/// post-trade price — otherwise a trader could push the (intentionally
+/// thin) vAMM price to trigger favorable liquidations against themselves or
+/// others. Only a *new* trade's fill price should ever come from the vAMM.
+pub fn unrealized_pnl_usd(
+    size_signed: Decimal,
+    entry_price: Decimal,
+    base_intrinsic_now: Decimal,
+    quote_intrinsic_now: Decimal,
+) -> Decimal {
+    size_signed * (base_intrinsic_now - entry_price * quote_intrinsic_now)
+}
+
+/// Current USD notional of a position's base leg. The quote leg cancels out
+/// of this calculation (it only matters for PnL, not notional size).
+pub fn notional_usd_now(size_signed: Decimal, base_intrinsic_now: Decimal) -> Decimal {
+    size_signed.abs() * base_intrinsic_now
+}
+
+/// equity / notional — the standard perp margin-health ratio. Returns `None`
+/// when there's no notional to divide by (should not happen for a real open
+/// position, but callers must not assume this is infallible).
+pub fn margin_ratio(equity_usd: Decimal, notional_usd_now: Decimal) -> Option<Decimal> {
+    if notional_usd_now.is_zero() {
+        return None;
+    }
+    Some(equity_usd / notional_usd_now)
+}
+
+/// A position is liquidatable once its equity (margin + unrealized PnL) falls
+/// to or below `maintenance_margin_ratio` of its current notional.
+pub fn is_liquidatable(
+    margin_usd: Decimal,
+    unrealized_pnl_usd: Decimal,
+    notional_usd_now: Decimal,
+    maintenance_margin_ratio: Decimal,
+) -> bool {
+    match margin_ratio(margin_usd + unrealized_pnl_usd, notional_usd_now) {
+        Some(ratio) => ratio <= maintenance_margin_ratio,
+        None => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    #[test]
+    fn long_pnl_positive_when_base_appreciates() {
+        // Entered long 10 units at entry_price=2.0 (quote intrinsic was 100 at entry).
+        // Base intrinsic rises from 200 to 250, quote stays at 100.
+        let pnl = unrealized_pnl_usd(dec!(10), dec!(2.0), dec!(250), dec!(100));
+        // (250 - 2.0*100) * 10 = (250-200)*10 = 500
+        assert_eq!(pnl, dec!(500));
+    }
+
+    #[test]
+    fn short_pnl_positive_when_base_depreciates() {
+        // Short 10 units at entry_price=2.0, quote intrinsic 100 at entry.
+        // Base intrinsic falls from 200 to 150.
+        let pnl = unrealized_pnl_usd(dec!(-10), dec!(2.0), dec!(150), dec!(100));
+        // (150-200)*-10 = 500
+        assert_eq!(pnl, dec!(500));
+    }
+
+    #[test]
+    fn pnl_accounts_for_quote_leg_movement() {
+        // Long 10 units, entry_price=2.0, quote intrinsic at entry implied 100.
+        // Base unchanged at 200, but quote intrinsic rises to 120 (quote
+        // appreciated against base) - the position should show a loss even
+        // though the base leg alone didn't move.
+        let pnl = unrealized_pnl_usd(dec!(10), dec!(2.0), dec!(200), dec!(120));
+        // (200 - 2.0*120)*10 = (200-240)*10 = -400
+        assert_eq!(pnl, dec!(-400));
+    }
+
+    #[test]
+    fn notional_uses_absolute_size() {
+        assert_eq!(notional_usd_now(dec!(-10), dec!(200)), dec!(2000));
+        assert_eq!(notional_usd_now(dec!(10), dec!(200)), dec!(2000));
+    }
+
+    #[test]
+    fn margin_ratio_none_when_no_notional() {
+        assert_eq!(margin_ratio(dec!(100), dec!(0)), None);
+    }
+
+    #[test]
+    fn is_liquidatable_true_once_equity_breaches_maintenance() {
+        // margin=1000, notional=20000 (20x leverage), maintenance=0.5%.
+        // Maintenance equity floor = 0.005 * 20000 = 100.
+        let notional = dec!(20000);
+        let maintenance = dec!(0.005);
+
+        // Equity still comfortably above the floor (margin 1000, pnl -500 -> equity 500).
+        assert!(!is_liquidatable(dec!(1000), dec!(-500), notional, maintenance));
+
+        // Equity right at the floor (margin 1000, pnl -900 -> equity 100).
+        assert!(is_liquidatable(dec!(1000), dec!(-900), notional, maintenance));
+
+        // Equity below the floor.
+        assert!(is_liquidatable(dec!(1000), dec!(-950), notional, maintenance));
+    }
+
+    #[test]
+    fn is_liquidatable_false_for_healthy_position() {
+        assert!(!is_liquidatable(dec!(1000), dec!(200), dec!(20000), dec!(0.005)));
+    }
+}
