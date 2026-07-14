@@ -51,6 +51,29 @@ pub fn is_liquidatable(
     }
 }
 
+/// Whether a take-profit at `tp_price` (an index price, quote-per-base, same
+/// units as `entry_price`) should fire right now. For a long, TP is above
+/// entry and fires once the index price rises to meet or exceed it; for a
+/// short it's the mirror image.
+pub fn take_profit_triggered(size_signed: Decimal, index_price: Decimal, tp_price: Decimal) -> bool {
+    if size_signed > Decimal::ZERO {
+        index_price >= tp_price
+    } else {
+        index_price <= tp_price
+    }
+}
+
+/// Whether a stop-loss at `sl_price` should fire right now - the mirror of
+/// `take_profit_triggered`: for a long it fires once price falls to or below
+/// it, for a short once price rises to or above it.
+pub fn stop_loss_triggered(size_signed: Decimal, index_price: Decimal, sl_price: Decimal) -> bool {
+    if size_signed > Decimal::ZERO {
+        index_price <= sl_price
+    } else {
+        index_price >= sl_price
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,5 +139,33 @@ mod tests {
     #[test]
     fn is_liquidatable_false_for_healthy_position() {
         assert!(!is_liquidatable(dec!(1000), dec!(200), dec!(20000), dec!(0.005)));
+    }
+
+    #[test]
+    fn take_profit_triggers_for_long_when_price_rises_to_target() {
+        assert!(!take_profit_triggered(dec!(10), dec!(1.9), dec!(2.0)));
+        assert!(take_profit_triggered(dec!(10), dec!(2.0), dec!(2.0)));
+        assert!(take_profit_triggered(dec!(10), dec!(2.1), dec!(2.0)));
+    }
+
+    #[test]
+    fn take_profit_triggers_for_short_when_price_falls_to_target() {
+        assert!(!take_profit_triggered(dec!(-10), dec!(2.1), dec!(2.0)));
+        assert!(take_profit_triggered(dec!(-10), dec!(2.0), dec!(2.0)));
+        assert!(take_profit_triggered(dec!(-10), dec!(1.9), dec!(2.0)));
+    }
+
+    #[test]
+    fn stop_loss_triggers_for_long_when_price_falls_to_target() {
+        assert!(!stop_loss_triggered(dec!(10), dec!(2.1), dec!(2.0)));
+        assert!(stop_loss_triggered(dec!(10), dec!(2.0), dec!(2.0)));
+        assert!(stop_loss_triggered(dec!(10), dec!(1.9), dec!(2.0)));
+    }
+
+    #[test]
+    fn stop_loss_triggers_for_short_when_price_rises_to_target() {
+        assert!(!stop_loss_triggered(dec!(-10), dec!(1.9), dec!(2.0)));
+        assert!(stop_loss_triggered(dec!(-10), dec!(2.0), dec!(2.0)));
+        assert!(stop_loss_triggered(dec!(-10), dec!(2.1), dec!(2.0)));
     }
 }
