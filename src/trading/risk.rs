@@ -74,6 +74,39 @@ pub fn stop_loss_triggered(size_signed: Decimal, index_price: Decimal, sl_price:
     }
 }
 
+/// Flat per-fill trading fee, charged on the *executed* notional (post-
+/// slippage), not the requested one - matches how `fill_price`/`entry_price`
+/// already reflect the real fill rather than the request.
+pub fn trade_fee_usd(executed_notional_usd: Decimal, fee_rate: Decimal) -> Decimal {
+    executed_notional_usd.abs() * fee_rate
+}
+
+/// Funding rate for one interval: the vAMM price's premium (or discount)
+/// over the index price, clamped. Positive means the vAMM is trading above
+/// the index (longs pushed it there) - so longs pay shorts; negative is the
+/// mirror. This is the market-driven complement to `VammPool::repeg` - repeg
+/// forcibly resets the pool, funding gives traders an economic incentive to
+/// correct it themselves instead.
+pub fn funding_rate(vamm_price: Decimal, index_price: Decimal, cap: Decimal) -> Decimal {
+    if index_price.is_zero() {
+        return Decimal::ZERO;
+    }
+    ((vamm_price - index_price) / index_price).clamp(-cap, cap)
+}
+
+/// One position's funding settlement for this interval. Positive means the
+/// position pays (debit its margin); negative means it receives (credit its
+/// margin) - same sign convention as `unrealized_pnl_usd`'s caller-facing
+/// arithmetic. A long pays when `funding_rate` is positive (vAMM above
+/// index); a short pays when it's negative.
+pub fn funding_payment_usd(size_signed: Decimal, notional_usd_now: Decimal, funding_rate: Decimal) -> Decimal {
+    if size_signed.is_zero() {
+        return Decimal::ZERO;
+    }
+    let sign = if size_signed > Decimal::ZERO { Decimal::ONE } else { -Decimal::ONE };
+    sign * notional_usd_now * funding_rate
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,5 +200,69 @@ mod tests {
         assert!(!stop_loss_triggered(dec!(-10), dec!(1.9), dec!(2.0)));
         assert!(stop_loss_triggered(dec!(-10), dec!(2.0), dec!(2.0)));
         assert!(stop_loss_triggered(dec!(-10), dec!(2.1), dec!(2.0)));
+    }
+
+    #[test]
+    fn trade_fee_is_notional_times_rate_regardless_of_side() {
+        assert_eq!(trade_fee_usd(dec!(1000), dec!(0.0005)), dec!(0.5));
+        // Fee doesn't care whether notional came from a long or a short -
+        // callers always pass an already-absolute executed notional, but
+        // this guards against a negative slipping through unnoticed.
+        assert_eq!(trade_fee_usd(dec!(-1000), dec!(0.0005)), dec!(0.5));
+    }
+
+    #[test]
+    fn funding_rate_is_zero_when_vamm_matches_index() {
+        assert_eq!(funding_rate(dec!(2.0), dec!(2.0), dec!(0.005)), dec!(0));
+    }
+
+    #[test]
+    fn funding_rate_positive_when_vamm_trades_above_index() {
+        // 1% premium, capped at 0.5% - clamps to the cap.
+        let rate = funding_rate(dec!(2.02), dec!(2.0), dec!(0.005));
+        assert_eq!(rate, dec!(0.005));
+    }
+
+    #[test]
+    fn funding_rate_negative_when_vamm_trades_below_index() {
+        let rate = funding_rate(dec!(1.98), dec!(2.0), dec!(0.005));
+        assert_eq!(rate, dec!(-0.005));
+    }
+
+    #[test]
+    fn funding_rate_uncapped_within_bounds() {
+        // 0.1% premium, well under the 0.5% cap - passes through un-clamped.
+        let rate = funding_rate(dec!(2.002), dec!(2.0), dec!(0.005));
+        assert_eq!(rate, dec!(0.001));
+    }
+
+    #[test]
+    fn funding_rate_zero_when_index_price_is_zero() {
+        assert_eq!(funding_rate(dec!(2.0), dec!(0), dec!(0.005)), dec!(0));
+    }
+
+    #[test]
+    fn long_pays_funding_when_rate_is_positive() {
+        // 10-unit long, $20000 notional, 0.1% funding rate -> pays $20.
+        let payment = funding_payment_usd(dec!(10), dec!(20000), dec!(0.001));
+        assert_eq!(payment, dec!(20));
+    }
+
+    #[test]
+    fn short_receives_funding_when_rate_is_positive() {
+        // Mirror of the long case: same magnitude, opposite sign (receives).
+        let payment = funding_payment_usd(dec!(-10), dec!(20000), dec!(0.001));
+        assert_eq!(payment, dec!(-20));
+    }
+
+    #[test]
+    fn short_pays_funding_when_rate_is_negative() {
+        let payment = funding_payment_usd(dec!(-10), dec!(20000), dec!(-0.001));
+        assert_eq!(payment, dec!(20));
+    }
+
+    #[test]
+    fn funding_payment_zero_for_zero_size() {
+        assert_eq!(funding_payment_usd(dec!(0), dec!(20000), dec!(0.001)), dec!(0));
     }
 }
