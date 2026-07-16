@@ -251,12 +251,18 @@ impl ValuationEngine {
                         if let Some(mut player) = self.player_states.get_mut(&pid) {
                             player.volatility_factor = dec!(1.0);
 
-                            let (wp, wf, ws) = if is_window {
-                                (dec!(0.10), dec!(0.80), dec!(0.10))
-                            } else {
-                                (dec!(0.60), dec!(0.30), dec!(0.10))
-                            };
-                            let v = (wp * player.intrinsic_value) + (wf * player.form_weight) + (ws * player.sentiment_score);
+                            // form_weight/sentiment_score are multipliers everywhere else
+                            // in this engine (see the Goal-impact formula above) - they were
+                            // never meant to be blended additively with intrinsic_value,
+                            // which lives on a completely different, unbounded-growing scale.
+                            // Blending them as comparable terms (the old formula) silently
+                            // divided a player's value by ~3-10x on every single match.
+                            // `is_window` still lets a transfer window make current form
+                            // matter more, but now as an amplifier on the multiplier's
+                            // distance from neutral (1.0), not a weight on mismatched units.
+                            let form_sensitivity = if is_window { dec!(2.0) } else { dec!(0.5) };
+                            let form_multiplier = dec!(1.0) + (player.form_weight - dec!(1.0)) * form_sensitivity;
+                            let v = player.intrinsic_value * form_multiplier * player.sentiment_score;
 
                             player.performance_history.push(v);
                             if player.performance_history.len() > 10 {
@@ -321,5 +327,60 @@ impl ValuationCalculator for ValuationEngine {
         let one_second = dec!(1) / dec!(60);
         let t_rem_capped = if t_remaining < one_second { one_second } else { t_remaining };
         v_base * (dec!(1) + (g / t_rem_capped))
+    }
+}
+
+#[cfg(test)]
+mod whistle_end_tests {
+    use super::*;
+
+    fn engine_with_one_player(intrinsic_value: Decimal, form_weight: Decimal) -> (ValuationEngine, ClubId, PlayerId) {
+        let engine = ValuationEngine::new();
+        let club_id = ClubId(1);
+        engine.club_states.insert(club_id, ClubState::new(club_id));
+
+        let player_id = PlayerId(1);
+        engine.player_states.insert(
+            player_id,
+            PlayerValues {
+                team_id: club_id,
+                intrinsic_value,
+                form_weight,
+                sentiment_score: dec!(1.0),
+                volatility_factor: dec!(1.0),
+                performance_history: vec![intrinsic_value; 5],
+                position: Position::CM,
+                is_captain: false,
+            },
+        );
+        (engine, club_id, player_id)
+    }
+
+    /// A player at neutral form/sentiment (both 1.0) should stay essentially
+    /// flat across repeated match-ends with no goals/cards in between - this
+    /// is the exact regression the old additive-blend formula failed: it
+    /// divided intrinsic_value toward zero every single WhistleEnd
+    /// regardless of form, because it blended an unbounded absolute value
+    /// with two multipliers pinned near 1.0 as if they were the same scale.
+    #[test]
+    fn neutral_form_does_not_decay_value_over_repeated_matches() {
+        let (engine, club_id, player_id) = engine_with_one_player(dec!(65.0), dec!(1.0));
+        for ts in 0..10u64 {
+            engine.process_event(MatchEvent::WhistleEnd { team_a_id: club_id, team_b_id: club_id }, ts);
+        }
+        let value = engine.player_states.get(&player_id).unwrap().intrinsic_value;
+        assert!(value > dec!(60.0), "expected value to stay near 65.0, got {value}");
+    }
+
+    /// Degraded form (e.g. after a red card halves form_weight to 0.5)
+    /// should pull the value down proportionally, not collapse it toward a
+    /// tiny fraction of its original scale.
+    #[test]
+    fn degraded_form_pulls_value_down_proportionally_not_to_near_zero() {
+        let (engine, club_id, player_id) = engine_with_one_player(dec!(65.0), dec!(0.5));
+        engine.process_event(MatchEvent::WhistleEnd { team_a_id: club_id, team_b_id: club_id }, 0);
+        let value = engine.player_states.get(&player_id).unwrap().intrinsic_value;
+        assert!(value > dec!(30.0), "expected a proportional pull-down, not a collapse - got {value}");
+        assert!(value < dec!(65.0), "degraded form should still pull the value down some - got {value}");
     }
 }

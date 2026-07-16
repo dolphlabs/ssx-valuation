@@ -10,34 +10,34 @@ pub fn seed(engine: &mut ValuationEngine) {
     engine.names.insert(club_id.0, "Real Valladolid".to_string());
 
     let players = vec![
-        (20901, "Karl Hein", Position::GK, dec!(25.0), false),
-        (20902, "Luis Perez", Position::RB, dec!(25.0), false),
-        (20903, "Javi Sanchez", Position::CB, dec!(25.0), true),
-        (20904, "Eray Comert", Position::CB, dec!(30.0), false),
-        (20905, "Lucas Rosa", Position::LB, dec!(25.0), false),
-        (20906, "Stanko Juric", Position::CDM, dec!(25.0), false),
-        (20907, "Kike Perez", Position::CM, dec!(25.0), false),
-        (20908, "Ivan Sanchez", Position::RW, dec!(20.0), false),
-        (20909, "Selim Amallah", Position::CAM, dec!(35.0), false),
-        (20910, "Raul Moro", Position::LW, dec!(40.0), false),
-        (20911, "Mamadou Sylla", Position::ST, dec!(30.0), false),
+        (20901, "Karl Hein", Position::GK, dec!(25.0), dec!(1.0), false),
+        (20902, "Luis Perez", Position::RB, dec!(25.0), dec!(1.0), false),
+        (20903, "Javi Sanchez", Position::CB, dec!(25.0), dec!(1.0), true),
+        (20904, "Eray Comert", Position::CB, dec!(30.0), dec!(1.0), false),
+        (20905, "Lucas Rosa", Position::LB, dec!(25.0), dec!(1.0), false),
+        (20906, "Stanko Juric", Position::CDM, dec!(25.0), dec!(1.0), false),
+        (20907, "Kike Perez", Position::CM, dec!(25.0), dec!(1.0), false),
+        (20908, "Ivan Sanchez", Position::RW, dec!(20.0), dec!(1.0), false),
+        (20909, "Selim Amallah", Position::CAM, dec!(35.0), dec!(1.0), false),
+        (20910, "Raul Moro", Position::LW, dec!(40.0), dec!(1.0), false),
+        (20911, "Mamadou Sylla", Position::ST, dec!(30.0), dec!(1.0), false),
         // Bench
-        (20912, "Andre Ferreira", Position::GK, dec!(15.0), false),
-        (20913, "Cenk Ozkacar", Position::CB, dec!(30.0), false),
-        (20914, "David Torres", Position::CB, dec!(15.0), false),
-        (20915, "Victor Meseguer", Position::CM, dec!(25.0), false),
-        (20916, "Monchu", Position::CM, dec!(30.0), false), // Monchu left for Aris, let's use Mario Martin
-        (20917, "Mario Martin", Position::CDM, dec!(30.0), false),
-        (20918, "Anuar", Position::RM, dec!(15.0), false),
-        (20919, "Amath Ndiaye", Position::LW, dec!(25.0), false),
-        (20920, "Latasa", Position::ST, dec!(30.0), false),
+        (20912, "Andre Ferreira", Position::GK, dec!(15.0), dec!(1.0), false),
+        (20913, "Cenk Ozkacar", Position::CB, dec!(30.0), dec!(1.0), false),
+        (20914, "David Torres", Position::CB, dec!(15.0), dec!(1.0), false),
+        (20915, "Victor Meseguer", Position::CM, dec!(25.0), dec!(1.0), false),
+        (20916, "Monchu", Position::CM, dec!(30.0), dec!(1.0), false), // Monchu left for Aris, let's use Mario Martin
+        (20917, "Mario Martin", Position::CDM, dec!(30.0), dec!(1.0), false),
+        (20918, "Anuar", Position::RM, dec!(15.0), dec!(1.0), false),
+        (20919, "Amath Ndiaye", Position::LW, dec!(25.0), dec!(1.0), false),
+        (20920, "Latasa", Position::ST, dec!(30.0), dec!(1.0), false),
     ];
 
-    for (id, name, pos, val, captain) in players {
+    for (id, name, pos, val, form_weight, captain) in players {
         engine.player_states.insert(PlayerId(id), PlayerValues {
             team_id: club_id,
             intrinsic_value: val,
-            form_weight: dec!(1.0),
+            form_weight,
             sentiment_score: dec!(1.0),
             volatility_factor: dec!(1.0),
             performance_history: vec![],

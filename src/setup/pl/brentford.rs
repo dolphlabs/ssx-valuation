@@ -6,7 +6,7 @@ pub fn seed(engine: &mut ValuationEngine) {
     let mut club = ClubState::new(club_id);
     engine.names.insert(club_id.0, "Brentford".to_string());
     
-    club.intrinsic_value = dec!(480.00);
+    club.intrinsic_value = dec!(781.81);
     
     // Rivals: Fulham (12), Chelsea (6)
     club.set_rival_factor(ClubId(12), dec!(1.3));
@@ -16,33 +16,33 @@ pub fn seed(engine: &mut ValuationEngine) {
 
     // Players
     let players = vec![
-        (1701, "Mark Flekken", Position::GK, dec!(35.0), false),
-        (1702, "Bryan Mbeumo", Position::RW, dec!(75.0), false),
-        (1703, "Yoane Wissa", Position::LW, dec!(60.0), false),
-        (1704, "Christian Norgaard", Position::CDM, dec!(50.0), true),
-        (1705, "Mathias Jensen", Position::CM, dec!(45.0), false),
-        (1706, "Ethan Pinnock", Position::CB, dec!(50.0), false),
-        (1707, "Nathan Collins", Position::CB, dec!(55.0), false),
-        (1708, "Kristoffer Ajer", Position::CB, dec!(45.0), false),
-        (1709, "Mikkel Damsgaard", Position::CAM, dec!(45.0), false),
-        (1710, "Kevin Schade", Position::LW, dec!(40.0), false),
-        (1711, "Igor Thiago", Position::ST, dec!(50.0), false),
-        (1712, "Hakon Valdimarsson", Position::GK, dec!(15.0), false),
-        (1713, "Sepp van den Berg", Position::CB, dec!(45.0), false),
-        (1714, "Mads Roerslev", Position::RB, dec!(30.0), false),
-        (1715, "Vitaly Janelt", Position::CDM, dec!(45.0), false),
-        (1716, "Yunus Emre Konak", Position::CDM, dec!(25.0), false),
-        (1717, "Fabio Carvalho", Position::CAM, dec!(55.0), false),
-        (1718, "Keane Lewis-Potter", Position::LW, dec!(40.0), false),
-        (1719, "Gustavo Nunes", Position::LW, dec!(35.0), false),
+        (1701, "Mark Flekken", Position::GK, dec!(35.00), dec!(1.0), false),
+        (1702, "Bryan Mbeumo", Position::RW, dec!(75.00), dec!(1.0), false),
+        (1703, "Yoane Wissa", Position::LW, dec!(60.00), dec!(1.0), false),
+        (1704, "Christian Norgaard", Position::CDM, dec!(50.00), dec!(1.0), true),
+        (1705, "Mathias Jensen", Position::CM, dec!(57.45), dec!(1.054), false),
+        (1706, "Ethan Pinnock", Position::CB, dec!(55.53), dec!(1.068), false),
+        (1707, "Nathan Collins", Position::CB, dec!(60.94), dec!(1.091), false),
+        (1708, "Kristoffer Ajer", Position::CB, dec!(48.83), dec!(1.034), false),
+        (1709, "Mikkel Damsgaard", Position::CAM, dec!(59.50), dec!(1.063), false),
+        (1710, "Kevin Schade", Position::LW, dec!(59.34), dec!(1.096), false),
+        (1711, "Igor Thiago", Position::ST, dec!(104.07), dec!(1.030), false),
+        (1712, "Hakon Valdimarsson", Position::GK, dec!(15.00), dec!(1.0), false),
+        (1713, "Sepp van den Berg", Position::CB, dec!(51.24), dec!(1.071), false),
+        (1714, "Mads Roerslev", Position::RB, dec!(30.00), dec!(1.0), false),
+        (1715, "Vitaly Janelt", Position::CDM, dec!(49.11), dec!(1.076), false),
+        (1716, "Yunus Emre Konak", Position::CDM, dec!(25.00), dec!(1.0), false),
+        (1717, "Fabio Carvalho", Position::CAM, dec!(64.76), dec!(1.036), false),
+        (1718, "Keane Lewis-Potter", Position::LW, dec!(51.71), dec!(1.071), false),
+        (1719, "Gustavo Nunes", Position::LW, dec!(35.00), dec!(1.0), false),
     ];
 
-    for (id, name, pos, val, captain) in players {
+    for (id, name, pos, val, form_weight, captain) in players {
         engine.names.insert(id, name.to_string());
         engine.player_states.insert(PlayerId(id), PlayerValues {
             team_id: club_id,
             intrinsic_value: val,
-            form_weight: dec!(1.0),
+            form_weight,
             sentiment_score: dec!(1.0),
             volatility_factor: dec!(1.0),
             performance_history: vec![val; 5],

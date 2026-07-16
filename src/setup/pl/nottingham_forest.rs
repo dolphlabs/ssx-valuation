@@ -6,7 +6,7 @@ pub fn seed(engine: &mut ValuationEngine) {
     let mut club = ClubState::new(club_id);
     engine.names.insert(club_id.0, "Nottingham Forest".to_string());
     
-    club.intrinsic_value = dec!(420.00);
+    club.intrinsic_value = dec!(652.44);
     
     // Rivals: Leicester (19), Derby (Not in PL)
     club.set_rival_factor(ClubId(19), dec!(1.4));
@@ -15,34 +15,34 @@ pub fn seed(engine: &mut ValuationEngine) {
 
     // Players
     let players = vec![
-        (1801, "Matz Sels", Position::GK, dec!(30.0), false),
-        (1802, "Morgan Gibbs-White", Position::CAM, dec!(75.0), true),
-        (1803, "Chris Wood", Position::ST, dec!(45.0), false),
-        (1804, "Callum Hudson-Odoi", Position::LW, dec!(55.0), false),
-        (1805, "Anthony Elanga", Position::RW, dec!(50.0), false),
-        (1806, "Murillo", Position::CB, dec!(65.0), false),
-        (1807, "Nikola Milenkovic", Position::CB, dec!(50.0), false),
-        (1808, "Ola Aina", Position::RB, dec!(40.0), false),
-        (1809, "Elliot Anderson", Position::CM, dec!(45.0), false),
-        (1810, "Taiwo Awoniyi", Position::ST, dec!(50.0), false),
-        (1811, "Danilo", Position::CDM, dec!(45.0), false),
-        (1812, "Carlos Miguel", Position::GK, dec!(25.0), false),
-        (1813, "Andrew Omobamidele", Position::CB, dec!(35.0), false),
-        (1814, "Morrys", Position::CB, dec!(50.0), false), // Morato? let's use Morato
-        (1815, "Neco Williams", Position::RB, dec!(45.0), false),
-        (1816, "Ibrahim Sangare", Position::CDM, dec!(50.0), false),
-        (1817, "James Ward-Prowse", Position::CM, dec!(55.0), false),
-        (1818, "Nicolas Dominguez", Position::CM, dec!(45.0), false),
-        (1819, "Ramon Sosa", Position::RW, dec!(40.0), false),
-        (1820, "Jota Silva", Position::LW, dec!(45.0), false),
+        (1801, "Matz Sels", Position::GK, dec!(31.53), dec!(1.035), false),
+        (1802, "Morgan Gibbs-White", Position::CAM, dec!(116.74), dec!(1.122), true),
+        (1803, "Chris Wood", Position::ST, dec!(55.40), dec!(1.023), false),
+        (1804, "Callum Hudson-Odoi", Position::LW, dec!(77.19), dec!(1.093), false),
+        (1805, "Anthony Elanga", Position::RW, dec!(50.00), dec!(1.0), false),
+        (1806, "Murillo", Position::CB, dec!(80.00), dec!(1.002), false),
+        (1807, "Nikola Milenkovic", Position::CB, dec!(50.00), dec!(1.0), false),
+        (1808, "Ola Aina", Position::RB, dec!(46.12), dec!(1.105), false),
+        (1809, "Elliot Anderson", Position::CM, dec!(60.64), dec!(1.082), false),
+        (1810, "Taiwo Awoniyi", Position::ST, dec!(62.86), dec!(1.017), false),
+        (1811, "Danilo", Position::CDM, dec!(45.00), dec!(1.0), false),
+        (1812, "Carlos Miguel", Position::GK, dec!(25.00), dec!(1.0), false),
+        (1813, "Andrew Omobamidele", Position::CB, dec!(35.00), dec!(1.0), false),
+        (1814, "Morrys", Position::CB, dec!(50.00), dec!(1.0), false), // Morato? let's use Morato
+        (1815, "Neco Williams", Position::RB, dec!(54.23), dec!(1.068), false),
+        (1816, "Ibrahim Sangare", Position::CDM, dec!(64.72), dec!(1.053), false),
+        (1817, "James Ward-Prowse", Position::CM, dec!(55.00), dec!(1.0), false),
+        (1818, "Nicolas Dominguez", Position::CM, dec!(52.09), dec!(1.038), false),
+        (1819, "Ramon Sosa", Position::RW, dec!(40.00), dec!(1.0), false),
+        (1820, "Jota Silva", Position::LW, dec!(47.98), dec!(1.023), false),
     ];
 
-    for (id, name, pos, val, captain) in players {
+    for (id, name, pos, val, form_weight, captain) in players {
         engine.names.insert(id, name.to_string());
         engine.player_states.insert(PlayerId(id), PlayerValues {
             team_id: club_id,
             intrinsic_value: val,
-            form_weight: dec!(1.0),
+            form_weight,
             sentiment_score: dec!(1.0),
             volatility_factor: dec!(1.0),
             performance_history: vec![val; 5],

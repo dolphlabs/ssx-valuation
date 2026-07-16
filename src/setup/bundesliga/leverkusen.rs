@@ -4,7 +4,7 @@ use rust_decimal_macros::dec;
 pub fn seed(engine: &mut ValuationEngine) {
     let club_id = ClubId(4001);
     let mut club = ClubState::new(club_id);
-    club.intrinsic_value = dec!(980.00); // Unbeaten champions
+    club.intrinsic_value = dec!(1418.52); // Unbeaten champions
     
     club.set_rival_factor(ClubId(4002), dec!(1.3)); // Bayern Munich
     club.set_rival_factor(ClubId(4005), dec!(1.25)); // Dortmund
@@ -13,34 +13,34 @@ pub fn seed(engine: &mut ValuationEngine) {
     engine.names.insert(club_id.0, "Bayer Leverkusen".to_string());
 
     let players = vec![
-        (40001, "Lukas Hradecky", Position::GK, dec!(45.0), true),
-        (40002, "Edmond Tapsoba", Position::CB, dec!(65.0), false),
-        (40003, "Jonathan Tah", Position::CB, dec!(55.0), false),
-        (40004, "Piero Hincapie", Position::CB, dec!(60.0), false),
-        (40005, "Jeremie Frimpong", Position::RM, dec!(80.0), false),
-        (40006, "Granit Xhaka", Position::CDM, dec!(75.0), false),
-        (40007, "Aleix Garcia", Position::CM, dec!(50.0), false),
-        (40008, "Alejandro Grimaldo", Position::LM, dec!(70.0), false),
-        (40009, "Florian Wirtz", Position::CAM, dec!(130.0), false),
-        (40010, "Martin Terrier", Position::LW, dec!(45.0), false),
-        (40011, "Victor Boniface", Position::ST, dec!(75.0), false),
+        (40001, "Lukas Hradecky", Position::GK, dec!(45.00), dec!(1.0), true),
+        (40002, "Edmond Tapsoba", Position::CB, dec!(96.49), dec!(1.051), false),
+        (40003, "Jonathan Tah", Position::CB, dec!(55.00), dec!(1.0), false),
+        (40004, "Piero Hincapie", Position::CB, dec!(72.37), dec!(1.062), false),
+        (40005, "Jeremie Frimpong", Position::RM, dec!(80.00), dec!(1.0), false),
+        (40006, "Granit Xhaka", Position::CDM, dec!(75.00), dec!(1.0), false),
+        (40007, "Aleix Garcia", Position::CM, dec!(70.72), dec!(1.127), false),
+        (40008, "Alejandro Grimaldo", Position::LM, dec!(120.33), dec!(1.113), false),
+        (40009, "Florian Wirtz", Position::CAM, dec!(130.00), dec!(1.0), false),
+        (40010, "Martin Terrier", Position::LW, dec!(58.54), dec!(1.032), false),
+        (40011, "Victor Boniface", Position::ST, dec!(75.00), dec!(1.0), false),
         // Bench
-        (40012, "Matej Kovar", Position::GK, dec!(35.0), false),
-        (40013, "Jeanuel Belocian", Position::CB, dec!(30.0), false),
-        (40014, "Nordi Mukiele", Position::RB, dec!(40.0), false),
-        (40015, "Robert Andrich", Position::CDM, dec!(45.0), false),
-        (40016, "Exequiel Palacios", Position::CM, dec!(55.0), false),
-        (40017, "Jonas Hofmann", Position::CAM, dec!(40.0), false),
-        (40018, "Amine Adli", Position::RW, dec!(55.0), false),
-        (40019, "Patrik Schick", Position::ST, dec!(45.0), false),
-        (40020, "Nathan Tella", Position::RM, dec!(40.0), false),
+        (40012, "Matej Kovar", Position::GK, dec!(35.00), dec!(1.0), false),
+        (40013, "Jeanuel Belocian", Position::CB, dec!(31.74), dec!(1.027), false),
+        (40014, "Nordi Mukiele", Position::RB, dec!(40.00), dec!(1.0), false),
+        (40015, "Robert Andrich", Position::CDM, dec!(45.88), dec!(1.049), false),
+        (40016, "Exequiel Palacios", Position::CM, dec!(61.16), dec!(1.066), false),
+        (40017, "Jonas Hofmann", Position::CAM, dec!(49.29), dec!(1.039), false),
+        (40018, "Amine Adli", Position::RW, dec!(55.00), dec!(1.0), false),
+        (40019, "Patrik Schick", Position::ST, dec!(107.74), dec!(1.080), false),
+        (40020, "Nathan Tella", Position::RM, dec!(47.53), dec!(1.172), false),
     ];
 
-    for (id, name, pos, val, captain) in players {
+    for (id, name, pos, val, form_weight, captain) in players {
         engine.player_states.insert(PlayerId(id), PlayerValues {
             team_id: club_id,
             intrinsic_value: val,
-            form_weight: dec!(1.0),
+            form_weight,
             sentiment_score: dec!(1.0),
             volatility_factor: dec!(1.0),
             performance_history: vec![],
