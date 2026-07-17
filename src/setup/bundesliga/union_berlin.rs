@@ -43,6 +43,7 @@ pub fn seed(engine: &mut ValuationEngine) {
             performance_history: vec![],
             position: pos,
             is_captain: captain,
+            active: true,
         });
         engine.names.insert(id, name.to_string());
         if let Some(mut c) = engine.club_states.get_mut(&club_id) {

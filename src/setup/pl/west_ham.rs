@@ -50,6 +50,7 @@ pub fn seed(engine: &mut ValuationEngine) {
             performance_history: vec![val; 5],
             position: pos,
             is_captain: captain,
+            active: true,
         });
     }
 }

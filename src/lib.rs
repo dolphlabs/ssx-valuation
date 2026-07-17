@@ -3,6 +3,7 @@ use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 use dashmap::DashMap;
 use tokio::sync::mpsc;
 
@@ -11,6 +12,8 @@ pub mod setup;
 pub mod oracle;
 pub mod env_config;
 pub mod trading;
+pub mod api_football;
+pub mod transfers;
 
 // --- ID Newtypes ---
 
@@ -70,6 +73,13 @@ pub struct PlayerValues {
     pub performance_history: Vec<Decimal>,
     pub position: Position,
     pub is_captain: bool,
+    /// Soft-delete flag: false once a transfer moves this player out of our
+    /// tracked leagues entirely. Never hard-deleted - `crate::transfers` can
+    /// reactivate a returning player against this same record instead of
+    /// creating a duplicate. `WhistleEnd`'s per-club recompute skips inactive
+    /// players (see `process_event`), so a departed player's value simply
+    /// freezes at whatever it was when they left.
+    pub active: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,6 +142,10 @@ pub struct ValuationEngine {
     pub club_states: Arc<DashMap<ClubId, ClubState>>,
     pub names: Arc<DashMap<u32, String>>, // Keep name lookup as u32 for now, or consider generic
     pub is_transfer_window: std::sync::atomic::AtomicBool,
+    /// Next id handed to a player created by `transfers::process_transfer`
+    /// for a signing from outside our tracked universe. See
+    /// `transfers::DYNAMIC_PLAYER_ID_BASE` for why this starts where it does.
+    pub next_dynamic_player_id: AtomicU32,
     pub update_tx: Option<mpsc::UnboundedSender<EngineUpdate>>,
 }
 
@@ -142,6 +156,7 @@ impl ValuationEngine {
             club_states: Arc::new(DashMap::with_capacity(200)),
             names: Arc::new(DashMap::with_capacity(2200)),
             is_transfer_window: std::sync::atomic::AtomicBool::new(false),
+            next_dynamic_player_id: transfers::new_dynamic_player_id_counter(),
             update_tx: None,
         }
     }
@@ -243,7 +258,7 @@ impl ValuationEngine {
                     }
                     
                         let pids: Vec<PlayerId> = self.player_states.iter()
-                        .filter(|entry| entry.value().team_id == team_id)
+                        .filter(|entry| entry.value().team_id == team_id && entry.value().active)
                         .map(|entry| *entry.key())
                         .collect();
 
@@ -351,6 +366,7 @@ mod whistle_end_tests {
                 performance_history: vec![intrinsic_value; 5],
                 position: Position::CM,
                 is_captain: false,
+                active: true,
             },
         );
         (engine, club_id, player_id)
