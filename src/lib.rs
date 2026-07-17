@@ -14,6 +14,7 @@ pub mod env_config;
 pub mod trading;
 pub mod api_football;
 pub mod transfers;
+pub mod live_match;
 
 // --- ID Newtypes ---
 
