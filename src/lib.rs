@@ -17,6 +17,26 @@ pub mod transfers;
 pub mod live_match;
 pub mod injuries;
 
+/// Approximate real transfer-window calendar for the Big Five leagues:
+/// summer (June 1 - Sept 1) and winter (Jan 1 - Feb 3). Deadlines vary
+/// slightly year to year and league to league - this is deliberately a
+/// close approximation, not scraped from a real calendar API, since the
+/// only thing it drives is how strongly `WhistleEnd` weights recent form
+/// (see `is_transfer_window`'s usage in `process_event`), not anything
+/// requiring day-level precision. Takes plain `(month, day)` rather than a
+/// `chrono` type so this crate doesn't need a date-time dependency just for
+/// one calendar check - callers that already have `chrono` (e.g. `ssx-node`)
+/// extract the two integers from `Utc::now()`.
+pub fn is_transfer_window_open(month: u32, day: u32) -> bool {
+    match month {
+        6 | 7 | 8 => true,
+        9 => day <= 1,
+        1 => true,
+        2 => day <= 3,
+        _ => false,
+    }
+}
+
 // --- ID Newtypes ---
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
@@ -89,6 +109,14 @@ pub struct ClubState {
     pub id: ClubId,
     pub intrinsic_value: Decimal,
     pub last_match_update: u64,
+    /// The value as of the last *real* event (Goal/Card/WhistleEnd) that
+    /// touched this club - the anchor `apply_stale_club_reversion` pulls a
+    /// long-quiet club's `intrinsic_value` back toward. `Option` (not a bare
+    /// `Decimal` defaulting to zero) so that a Redis-persisted `ClubState`
+    /// from before this field existed deserializes safely (`#[serde(default)]`
+    /// gives `None`) instead of silently anchoring toward zero.
+    #[serde(default)]
+    pub resting_value: Option<Decimal>,
     pub top_oppositions: BTreeMap<ClubId, Decimal>,
     pub rivals: Vec<(ClubId, Decimal)>,
     pub player_ids: Vec<PlayerId>,
@@ -100,6 +128,7 @@ impl ClubState {
             id,
             intrinsic_value: dec!(100.0),
             last_match_update: 0,
+            resting_value: Some(dec!(100.0)),
             top_oppositions: BTreeMap::new(),
             rivals: Vec::new(),
             player_ids: Vec::new(),
@@ -177,20 +206,41 @@ impl ValuationEngine {
         self.is_transfer_window.store(is_window, std::sync::atomic::Ordering::Relaxed);
     }
 
-    pub fn apply_leaking_value(&self, current_ts: u64) {
-        let seven_days_secs = 7 * 24 * 60 * 60;
-        let one_day_secs = 24 * 60 * 60;
-        let leak_factor = dec!(1.0) - dec!(0.01);
+    /// Gently pulls a long-quiet club's `intrinsic_value` back toward
+    /// `resting_value` (its value as of the last *real* event) rather than
+    /// leaving it to whatever the heartbeat's random walk has drifted it to.
+    /// Deliberately a *reversion*, not a one-directional decay: the original
+    /// version of this always multiplied the value down, which - once a club
+    /// goes quiet for a week - becomes a free, predictable one-way bet
+    /// (short everything in the off-season). Pulling toward the last known
+    /// real anchor can move the price either way depending on which side of
+    /// it the heartbeat has wandered to, so there's no guaranteed direction
+    /// to farm.
+    ///
+    /// Closes a fixed fraction of the *current* gap each call rather than
+    /// computing an elapsed-time decay curve - simpler, self-correcting
+    /// (works regardless of how the gap got there, including heartbeat noise
+    /// still perturbing it between calls), and only meaningful given the
+    /// assumption (documented, not enforced here) that the caller invokes
+    /// this on a steady cadence. `PULL_FRACTION` is tuned for an hourly
+    /// caller: ~50% of the gap closes over 2 weeks of continued inactivity.
+    /// Never touches `last_match_update` itself - only a real event does
+    /// that - so this stays idempotent no matter how often it's called.
+    pub fn apply_stale_club_reversion(&self, current_ts: u64) {
+        const SEVEN_DAYS_SECS: u64 = 7 * 24 * 60 * 60;
+        const PULL_FRACTION: Decimal = dec!(0.002);
 
         for mut club in self.club_states.iter_mut() {
-            if current_ts > club.last_match_update + seven_days_secs {
-                let days_inactive = (current_ts - club.last_match_update) / one_day_secs;
-                for _ in 0..days_inactive {
-                    club.intrinsic_value *= leak_factor;
-                }
-                club.last_match_update = current_ts;
-                self.notify(EngineUpdate::Club { id: club.id, state: club.clone() });
+            if current_ts <= club.last_match_update + SEVEN_DAYS_SECS {
+                continue;
             }
+            let Some(resting_value) = club.resting_value else { continue };
+            let gap = resting_value - club.intrinsic_value;
+            if gap == Decimal::ZERO {
+                continue;
+            }
+            club.intrinsic_value += gap * PULL_FRACTION;
+            self.notify(EngineUpdate::Club { id: club.id, state: club.clone() });
         }
     }
 
@@ -211,6 +261,7 @@ impl ValuationEngine {
                     let impact = (dec!(5.0) + (dec!(10.0) * time_multiplier)) * rivalry_multiplier;
                     club.intrinsic_value += impact;
                     club.last_match_update = current_ts;
+                    club.resting_value = Some(club.intrinsic_value);
                     self.notify(EngineUpdate::Club { id: team_id, state: club.clone() });
                 }
                 if let Some(mut player) = self.player_states.get_mut(&player_id) {
@@ -225,6 +276,7 @@ impl ValuationEngine {
                 if let Some(mut club) = self.club_states.get_mut(&team_id) {
                     club.intrinsic_value -= dec!(7.5) * rivalry_multiplier;
                     club.last_match_update = current_ts;
+                    club.resting_value = Some(club.intrinsic_value);
                     self.notify(EngineUpdate::Club { id: team_id, state: club.clone() });
                 }
                 if let Some(mut player) = self.player_states.get_mut(&player_id) {
@@ -237,6 +289,7 @@ impl ValuationEngine {
                 if let Some(mut club) = self.club_states.get_mut(&team_id) {
                     club.intrinsic_value -= dec!(2.5) * rivalry_multiplier;
                     club.last_match_update = current_ts;
+                    club.resting_value = Some(club.intrinsic_value);
                     self.notify(EngineUpdate::Club { id: team_id, state: club.clone() });
                 }
                 if let Some(mut player) = self.player_states.get_mut(&player_id) {
@@ -256,6 +309,7 @@ impl ValuationEngine {
                 for &team_id in &[team_a_id, team_b_id] {
                     if let Some(mut club) = self.club_states.get_mut(&team_id) {
                         club.last_match_update = current_ts;
+                        club.resting_value = Some(club.intrinsic_value);
                         self.notify(EngineUpdate::Club { id: team_id, state: club.clone() });
                     }
                     
@@ -400,5 +454,117 @@ mod whistle_end_tests {
         let value = engine.player_states.get(&player_id).unwrap().intrinsic_value;
         assert!(value > dec!(30.0), "expected a proportional pull-down, not a collapse - got {value}");
         assert!(value < dec!(65.0), "degraded form should still pull the value down some - got {value}");
+    }
+}
+
+#[cfg(test)]
+mod stale_club_reversion_tests {
+    use super::*;
+
+    const SEVEN_DAYS_SECS: u64 = 7 * 24 * 60 * 60;
+
+    fn club_with(intrinsic_value: Decimal, resting_value: Decimal, last_match_update: u64) -> (ValuationEngine, ClubId) {
+        let engine = ValuationEngine::new();
+        let club_id = ClubId(1);
+        let mut club = ClubState::new(club_id);
+        club.intrinsic_value = intrinsic_value;
+        club.resting_value = Some(resting_value);
+        club.last_match_update = last_match_update;
+        engine.club_states.insert(club_id, club);
+        (engine, club_id)
+    }
+
+    /// The key fix: a club sitting *above* its resting anchor gets pulled
+    /// down, proving this isn't the old one-directional decay.
+    #[test]
+    fn pulls_down_toward_resting_value_when_above_it() {
+        let (engine, club_id) = club_with(dec!(120.0), dec!(100.0), 0);
+        engine.apply_stale_club_reversion(SEVEN_DAYS_SECS + 3600);
+        let value = engine.club_states.get(&club_id).unwrap().intrinsic_value;
+        assert!(value < dec!(120.0) && value > dec!(100.0), "expected a partial pull down toward 100.0, got {value}");
+    }
+
+    /// And a club sitting *below* its resting anchor gets pulled up - this is
+    /// the case the old always-multiply-down implementation could never do,
+    /// and the whole reason it was a farmable, one-way bet during a long
+    /// quiet spell.
+    #[test]
+    fn pulls_up_toward_resting_value_when_below_it() {
+        let (engine, club_id) = club_with(dec!(80.0), dec!(100.0), 0);
+        engine.apply_stale_club_reversion(SEVEN_DAYS_SECS + 3600);
+        let value = engine.club_states.get(&club_id).unwrap().intrinsic_value;
+        assert!(value > dec!(80.0) && value < dec!(100.0), "expected a partial pull up toward 100.0, got {value}");
+    }
+
+    #[test]
+    fn does_nothing_within_the_seven_day_grace_period() {
+        let (engine, club_id) = club_with(dec!(120.0), dec!(100.0), 0);
+        engine.apply_stale_club_reversion(SEVEN_DAYS_SECS - 3600); // one hour short of the gate
+        let value = engine.club_states.get(&club_id).unwrap().intrinsic_value;
+        assert_eq!(value, dec!(120.0));
+    }
+
+    #[test]
+    fn does_nothing_once_already_at_the_resting_value() {
+        let (engine, club_id) = club_with(dec!(100.0), dec!(100.0), 0);
+        engine.apply_stale_club_reversion(SEVEN_DAYS_SECS + 3600);
+        let value = engine.club_states.get(&club_id).unwrap().intrinsic_value;
+        assert_eq!(value, dec!(100.0));
+    }
+
+    /// Never touches `last_match_update` - repeated calls keep pulling
+    /// (idempotent w.r.t. the gate), rather than the original bug where
+    /// resetting it inside the function meant a fresh 7-day wait was needed
+    /// before the *next* single dose of decay.
+    #[test]
+    fn repeated_calls_keep_converging_without_resetting_the_gate() {
+        let (engine, club_id) = club_with(dec!(120.0), dec!(100.0), 0);
+        let mut last_value = dec!(120.0);
+        for _ in 0..5 {
+            engine.apply_stale_club_reversion(SEVEN_DAYS_SECS + 3600);
+            let value = engine.club_states.get(&club_id).unwrap().intrinsic_value;
+            assert!(value < last_value, "expected continued convergence toward 100.0, got {value} after {last_value}");
+            last_value = value;
+        }
+    }
+
+    #[test]
+    fn a_club_with_no_resting_value_yet_is_left_untouched() {
+        let (engine, club_id) = club_with(dec!(120.0), dec!(100.0), 0);
+        engine.club_states.get_mut(&club_id).unwrap().resting_value = None; // simulates a pre-migration Redis record
+        engine.apply_stale_club_reversion(SEVEN_DAYS_SECS + 3600);
+        let value = engine.club_states.get(&club_id).unwrap().intrinsic_value;
+        assert_eq!(value, dec!(120.0));
+    }
+}
+
+#[cfg(test)]
+mod transfer_window_tests {
+    use super::*;
+
+    #[test]
+    fn deep_summer_and_winter_are_open() {
+        assert!(is_transfer_window_open(7, 15));
+        assert!(is_transfer_window_open(1, 15));
+    }
+
+    #[test]
+    fn deadline_days_are_the_last_open_day() {
+        assert!(is_transfer_window_open(9, 1));
+        assert!(!is_transfer_window_open(9, 2));
+        assert!(is_transfer_window_open(2, 3));
+        assert!(!is_transfer_window_open(2, 4));
+    }
+
+    #[test]
+    fn mid_season_months_are_closed() {
+        assert!(!is_transfer_window_open(3, 15));
+        assert!(!is_transfer_window_open(10, 15));
+        assert!(!is_transfer_window_open(5, 31));
+    }
+
+    #[test]
+    fn window_opens_on_june_first() {
+        assert!(is_transfer_window_open(6, 1));
     }
 }
