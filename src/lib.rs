@@ -37,6 +37,57 @@ pub fn is_transfer_window_open(month: u32, day: u32) -> bool {
     }
 }
 
+/// The multiplier one `Heartbeat` tick applies to a club's `intrinsic_value`,
+/// given a symmetric shock drawn from `-magnitude..magnitude`.
+///
+/// `exp(shock)`, not `1.0 + shock` - the two look interchangeable for a tiny
+/// shock but aren't: for any symmetric `X` around zero, `E[ln(1+X)] < 0`
+/// (Jensen's inequality applied to the concave `ln`), while `E[ln(exp(X))]
+/// = E[X] = 0` exactly, by construction. Compounded across ~1.3M ticks/month
+/// at this engine's 2s heartbeat interval, the old `1.0 + shock` formula
+/// produced a real, systematic ~-5%/month downward drift for *every* club
+/// regardless of actual performance - confirmed both analytically (the
+/// closed-form expectation of `ln(1+X)` for `X ~ Uniform(-a,a)`) and via a
+/// 200-trial Monte Carlo. This is the same "volatility drag" that makes a
+/// stock earning +10% one day and -10% the next end up net negative, not
+/// flat - familiar from real finance, easy to miss when a random walk is
+/// implemented as "just multiply by 1 plus a small percentage."
+fn heartbeat_multiplier(shock: f64) -> Decimal {
+    Decimal::from_f64_retain(shock.exp()).unwrap_or(dec!(1.0))
+}
+
+/// Converts a target standalone monthly (30-day) volatility for the
+/// `Heartbeat` random walk into the per-tick uniform half-width the caller
+/// should draw `MatchEvent::Heartbeat`'s shock from. This is what keeps the
+/// walk's *magnitude* deliberately calibrated instead of an arbitrarily
+/// chosen per-tick constant - the exact mistake that let the (now-fixed)
+/// drift bug produce swings of ±50%+ a month on real production data,
+/// unrelated to any club's actual performance (see AGENTS.md's "Known
+/// gotchas"). "Standalone" matters: this is the volatility the walk would
+/// produce with *zero* real match events mixed in - real events (goals,
+/// cards, results) are expected to still dominate a club's actual month,
+/// this just bounds how much of that month is pure noise.
+///
+/// Derivation: `Uniform(-a,a)` has variance `a²/3`, so one tick's std is
+/// `a/sqrt(3)`. Because `heartbeat_multiplier` applies each shock on the
+/// log scale (`exp(shock)`, driftless), and per-tick shocks are small
+/// enough that summing them approximates the compounded log-return well,
+/// `N` independent ticks have variance `N * a²/3`. Solving for `a` given a
+/// target monthly variance:
+/// ```text
+/// target_monthly_std² = N_ticks_per_month * a² / 3
+/// a = target_monthly_std * sqrt(3 / N_ticks_per_month)
+/// ```
+/// `N_ticks_per_month` is derived from the real heartbeat interval, not a
+/// second hand-picked number - if the interval ever changes, the realized
+/// volatility stays correctly calibrated to `target_monthly_std` rather
+/// than silently drifting.
+pub fn heartbeat_tick_half_width(target_monthly_std: f64, heartbeat_interval_secs: f64) -> f64 {
+    const SECONDS_PER_MONTH: f64 = 30.0 * 24.0 * 3600.0;
+    let ticks_per_month = SECONDS_PER_MONTH / heartbeat_interval_secs;
+    target_monthly_std * (3.0 / ticks_per_month).sqrt()
+}
+
 // --- ID Newtypes ---
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
@@ -55,7 +106,11 @@ pub enum MatchEvent {
     RedCard { team_id: ClubId, opponent_id: ClubId, player_id: PlayerId },
     Injury { player_id: PlayerId, severity: u32 },
     WhistleEnd { team_a_id: ClubId, team_b_id: ClubId },
-    Heartbeat { team_id: ClubId },
+    /// `tick_std_pct` is the uniform half-width the shock is drawn from -
+    /// caller-supplied (see `heartbeat_tick_half_width`), not hardcoded
+    /// here, so the walk's magnitude is a calibrated, product-level
+    /// decision rather than an opaque constant nobody can reason about.
+    Heartbeat { team_id: ClubId, tick_std_pct: f64 },
 }
 
 // --- Position Modeling ---
@@ -347,20 +402,27 @@ impl ValuationEngine {
                     }
                 }
             }
-            MatchEvent::Heartbeat { team_id } => {
+            MatchEvent::Heartbeat { team_id, tick_std_pct } => {
                 if let Some(mut club) = self.club_states.get_mut(&team_id) {
                     club.last_match_update = current_ts;
-                    
-                    // Live Market Simulation: Geometric Brownian Motion-style drift
-                    // We use the volatility factor of the captain or a default
-                    // Todo: it should not be random
-                    use rand::Rng;
-                    let mut rng = rand::thread_rng();
-                    
-                    // Random walk: -0.05% to +0.05% change per heartbeat
-                    let change_pct = dec!(1.0) + (Decimal::from_f64_retain(rng.gen_range(-0.0005..0.0005)).unwrap_or(dec!(0)));
-                    club.intrinsic_value *= change_pct;
-                    
+
+                    // Live Market Simulation: driftless geometric random walk -
+                    // see heartbeat_multiplier's own comment for why this must
+                    // be exp(shock), not 1.0 + shock, and
+                    // heartbeat_tick_half_width's for where tick_std_pct comes
+                    // from (a calibrated target, not a hand-picked constant).
+                    // `gen_range` panics on an empty range, so a misconfigured
+                    // (or deliberately zero) volatility target skips the draw
+                    // entirely rather than crashing this tick for every club -
+                    // zero volatility legitimately means "no noise," not an
+                    // error.
+                    if tick_std_pct > 0.0 {
+                        use rand::Rng;
+                        let mut rng = rand::thread_rng();
+                        let shock: f64 = rng.gen_range(-tick_std_pct..tick_std_pct);
+                        club.intrinsic_value *= heartbeat_multiplier(shock);
+                    }
+
                     self.notify(EngineUpdate::Club { id: team_id, state: club.clone() });
                 }
             }
@@ -454,6 +516,120 @@ mod whistle_end_tests {
         let value = engine.player_states.get(&player_id).unwrap().intrinsic_value;
         assert!(value > dec!(30.0), "expected a proportional pull-down, not a collapse - got {value}");
         assert!(value < dec!(65.0), "degraded form should still pull the value down some - got {value}");
+    }
+}
+
+#[cfg(test)]
+mod heartbeat_drift_tests {
+    use super::*;
+
+    #[test]
+    fn zero_shock_is_the_identity() {
+        assert_eq!(heartbeat_multiplier(0.0), dec!(1.0));
+    }
+
+    /// The property the old `1.0 + shock` formula got wrong: an up-tick and
+    /// its exact mirror-image down-tick should cancel out to the identity.
+    /// `(1.0 + a) * (1.0 - a) = 1.0 - a²` - strictly less than 1, which is
+    /// exactly the source of the drift. `exp(a) * exp(-a) = 1.0` exactly.
+    #[test]
+    fn a_shock_and_its_mirror_image_cancel_out_exactly() {
+        let a = 0.0005;
+        let round_trip = heartbeat_multiplier(a) * heartbeat_multiplier(-a);
+        let diff = (round_trip - dec!(1.0)).abs();
+        assert!(diff < dec!(0.0000000001), "expected an up/down pair to net to ~1.0 exactly, got {round_trip}");
+    }
+
+    /// Direct regression guard: the fixed multiplier must land measurably
+    /// closer to 1.0 than the old, biased `1.0 + shock` formula would have,
+    /// for the same shock - proof this isn't just algebraically different
+    /// but actually less biased in the specific case that mattered (a
+    /// negative shock, where the old formula's downward pull compounds).
+    #[test]
+    fn fixed_multiplier_is_less_biased_than_the_old_formula_for_a_negative_shock() {
+        let a = -0.0005;
+        let old_buggy_multiplier = dec!(1.0) + Decimal::from_f64_retain(a).unwrap();
+        let fixed_multiplier = heartbeat_multiplier(a);
+        assert!(
+            fixed_multiplier > old_buggy_multiplier,
+            "exp(shock) should exceed 1.0+shock for a negative shock (exp is convex) - old={old_buggy_multiplier}, fixed={fixed_multiplier}"
+        );
+    }
+
+    /// The actual bug's real-world consequence, demonstrated directly:
+    /// compounding the *old* formula over many ticks with perfectly
+    /// symmetric shocks (an idealized fair coin flip, no real randomness)
+    /// still nets a loss - proving the drift is structural, not a
+    /// statistical fluke of any particular random seed. The *fixed*
+    /// formula, given the same symmetric shock sequence, nets to exactly
+    /// 1.0.
+    #[test]
+    fn symmetric_alternating_shocks_are_flat_under_the_fix_but_werent_before() {
+        let a = 0.0005;
+        let mut old_value = dec!(1.0);
+        let mut fixed_value = dec!(1.0);
+        for i in 0..1000 {
+            let shock = if i % 2 == 0 { a } else { -a };
+            let old_buggy_multiplier = dec!(1.0) + Decimal::from_f64_retain(shock).unwrap();
+            old_value *= old_buggy_multiplier;
+            fixed_value *= heartbeat_multiplier(shock);
+        }
+        assert!(old_value < dec!(0.9999), "expected the old formula to have drifted measurably down, got {old_value}");
+        let fixed_diff = (fixed_value - dec!(1.0)).abs();
+        assert!(fixed_diff < dec!(0.0000001), "expected the fixed formula to stay flat under symmetric shocks, got {fixed_value}");
+    }
+}
+
+#[cfg(test)]
+mod heartbeat_calibration_tests {
+    use super::*;
+
+    /// Round-trips the derivation: given the half-width `a` this function
+    /// returns for a target, compounding N ticks' worth of that magnitude's
+    /// variance should reproduce the target's variance - the actual
+    /// mathematical property that makes "target monthly volatility" a
+    /// meaningful, honest parameter rather than just a differently-shaped
+    /// magic number.
+    #[test]
+    fn compounding_the_derived_half_width_reproduces_the_target_variance() {
+        let target = 0.05; // 5% monthly
+        let interval_secs = 2.0;
+        let a = heartbeat_tick_half_width(target, interval_secs);
+
+        let ticks_per_month = 30.0 * 24.0 * 3600.0 / interval_secs;
+        let per_tick_variance = (a / 3f64.sqrt()).powi(2);
+        let compounded_variance = ticks_per_month * per_tick_variance;
+        let implied_monthly_std = compounded_variance.sqrt();
+
+        let diff = (implied_monthly_std - target).abs();
+        assert!(diff < 1e-9, "expected compounding the derived half-width to reproduce the {target} target, got {implied_monthly_std}");
+    }
+
+    /// The actual production default (5% monthly @ 2s) should land far
+    /// below the old, uncalibrated 0.0005 (~33% monthly, see AGENTS.md's
+    /// "Known gotchas") - the whole point of this function.
+    #[test]
+    fn default_calibration_is_far_smaller_than_the_old_uncalibrated_constant() {
+        let a = heartbeat_tick_half_width(0.05, 2.0);
+        assert!(a < 0.0005, "expected the calibrated half-width to be well under the old hardcoded 0.0005, got {a}");
+    }
+
+    /// Halving the interval doubles ticks/month, so - to hold the same
+    /// target monthly volatility - the per-tick half-width must shrink by
+    /// sqrt(2), not stay fixed. This is precisely the coupling that was
+    /// missing before: the interval and the magnitude must move together.
+    #[test]
+    fn a_faster_interval_requires_a_smaller_half_width_for_the_same_target() {
+        let target = 0.05;
+        let a_slow = heartbeat_tick_half_width(target, 2.0);
+        let a_fast = heartbeat_tick_half_width(target, 1.0); // half the interval
+        let ratio = a_slow / a_fast;
+        assert!((ratio - 2f64.sqrt()).abs() < 1e-9, "expected a sqrt(2) ratio, got {ratio}");
+    }
+
+    #[test]
+    fn zero_target_volatility_gives_zero_half_width() {
+        assert_eq!(heartbeat_tick_half_width(0.0, 2.0), 0.0);
     }
 }
 
