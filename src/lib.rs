@@ -16,6 +16,7 @@ pub mod api_football;
 pub mod transfers;
 pub mod live_match;
 pub mod injuries;
+pub mod admin_correction;
 
 /// Approximate real transfer-window calendar for the Big Five leagues:
 /// summer (June 1 - Sept 1) and winter (Jan 1 - Feb 3). Deadlines vary
@@ -111,6 +112,12 @@ pub enum MatchEvent {
     /// here, so the walk's magnitude is a calibrated, product-level
     /// decision rather than an opaque constant nobody can reason about.
     Heartbeat { team_id: ClubId, tick_std_pct: f64 },
+    /// A one-time, audited admin correction to `intrinsic_value` - see
+    /// `admin_correction::AdminCorrectionFact` for why this exists and the
+    /// isolation principle it preserves. `delta_pct` is applied
+    /// multiplicatively against whatever the club's value is *right now*,
+    /// not a value computed when the correction was requested.
+    AdminCorrection { team_id: ClubId, delta_pct: Decimal },
 }
 
 // --- Position Modeling ---
@@ -426,6 +433,18 @@ impl ValuationEngine {
                     self.notify(EngineUpdate::Club { id: team_id, state: club.clone() });
                 }
             }
+            MatchEvent::AdminCorrection { team_id, delta_pct } => {
+                if let Some(mut club) = self.club_states.get_mut(&team_id) {
+                    club.intrinsic_value *= dec!(1.0) + delta_pct / dec!(100.0);
+                    club.last_match_update = current_ts;
+                    // Same reasoning as every real event handler above -
+                    // anchor resting_value to the corrected value so
+                    // apply_stale_club_reversion has no stale target to
+                    // fight this back toward.
+                    club.resting_value = Some(club.intrinsic_value);
+                    self.notify(EngineUpdate::Club { id: team_id, state: club.clone() });
+                }
+            }
         }
     }
 
@@ -630,6 +649,66 @@ mod heartbeat_calibration_tests {
     #[test]
     fn zero_target_volatility_gives_zero_half_width() {
         assert_eq!(heartbeat_tick_half_width(0.0, 2.0), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod admin_correction_tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    fn engine_with_club(intrinsic_value: Decimal) -> (ValuationEngine, ClubId) {
+        let engine = ValuationEngine::new();
+        let club_id = ClubId(1);
+        let mut club = ClubState::new(club_id);
+        club.intrinsic_value = intrinsic_value;
+        club.resting_value = Some(intrinsic_value);
+        engine.club_states.insert(club_id, club);
+        (engine, club_id)
+    }
+
+    #[test]
+    fn positive_delta_increases_value_by_the_exact_percentage() {
+        let (engine, club_id) = engine_with_club(dec!(1000.0));
+        engine.process_event(MatchEvent::AdminCorrection { team_id: club_id, delta_pct: dec!(25.0) }, 0);
+        let club = engine.club_states.get(&club_id).unwrap();
+        assert_eq!(club.intrinsic_value, dec!(1250.0));
+    }
+
+    #[test]
+    fn negative_delta_decreases_value_by_the_exact_percentage() {
+        let (engine, club_id) = engine_with_club(dec!(1000.0));
+        engine.process_event(MatchEvent::AdminCorrection { team_id: club_id, delta_pct: dec!(-25.0) }, 0);
+        let club = engine.club_states.get(&club_id).unwrap();
+        assert_eq!(club.intrinsic_value, dec!(750.0));
+    }
+
+    /// The property that actually matters operationally: without this, the
+    /// very next `apply_stale_club_reversion` pass would see a gap between
+    /// the (now-stale) resting_value and the corrected intrinsic_value and
+    /// start pulling the correction straight back toward the pre-correction
+    /// number - silently undoing the fix it was meant to apply.
+    #[test]
+    fn resting_value_is_anchored_to_the_corrected_value_not_left_stale() {
+        let (engine, club_id) = engine_with_club(dec!(1000.0));
+        engine.process_event(MatchEvent::AdminCorrection { team_id: club_id, delta_pct: dec!(25.0) }, 0);
+        let club = engine.club_states.get(&club_id).unwrap();
+        assert_eq!(club.resting_value, Some(dec!(1250.0)));
+    }
+
+    #[test]
+    fn last_match_update_is_stamped_with_the_correction_timestamp() {
+        let (engine, club_id) = engine_with_club(dec!(1000.0));
+        engine.process_event(MatchEvent::AdminCorrection { team_id: club_id, delta_pct: dec!(10.0) }, 999_888);
+        let club = engine.club_states.get(&club_id).unwrap();
+        assert_eq!(club.last_match_update, 999_888);
+    }
+
+    #[test]
+    fn an_unknown_club_id_is_a_harmless_no_op() {
+        let engine = ValuationEngine::new();
+        // No club_states entry for this id at all - must not panic.
+        engine.process_event(MatchEvent::AdminCorrection { team_id: ClubId(999_999), delta_pct: dec!(50.0) }, 0);
     }
 }
 
