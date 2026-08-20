@@ -33,6 +33,35 @@ engine, for the reason you'd expect - security through actual access control, no
 security through obscurity of the math, which is the whole point of open-sourcing this
 part specifically.
 
+## Where the starting numbers in `src/setup/` come from
+
+Every club and player's starting `intrinsic_value` is a **real, computed baseline** -
+not hand-picked, not arbitrary, and not invented by this engine out of nothing.
+
+The starting point traces back to real transfer fees and market values (see the
+conversion comment in `transfers.rs` - a disclosed fee like "€75M" maps directly onto
+the engine's internal valuation-unit scale, chosen specifically to line up with
+real-data-backfilled player values already on that same scale). From there, the
+numbers you see in `src/setup/` are produced by `ssx-backfill` - a one-off tool in the
+private application repo (not included here, since it writes directly to Postgres,
+QuestDB, and Redis) - which:
+
+1. Seeds this exact engine from its previous baseline.
+2. Fetches every real fixture, match event (goals, cards), and per-player match
+   statistic for the completed season across all five leagues from API-Football.
+3. Replays those real events **chronologically, through this exact engine** -
+   deterministically, with the ambient heartbeat noise turned off - so a real goal
+   moves a club's value by precisely the same formula that runs live in production,
+   nothing softer or hand-tuned for the backfill.
+4. Updates each player's `form_weight` from real per-match performance stats.
+5. Mechanically rewrites just the two numbers per club/player (`intrinsic_value`,
+   `form_weight`) in these seed files to the resulting end-of-season state. Names,
+   positions, captain flags, and rivalry weightings are never touched by this process -
+   set once, independently, and left alone.
+
+This is a repeatable process, not a one-time guess: re-running
+`ssx-backfill fetch|replay|apply` is how the baseline gets refreshed going forward.
+
 ## Verify it yourself
 
 ```sh
