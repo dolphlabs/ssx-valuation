@@ -320,23 +320,33 @@ impl ValuationEngine {
                 let rivalry_multiplier = self.get_rivalry_multiplier(team_id, opponent_id);
                 if let Some(mut club) = self.club_states.get_mut(&team_id) {
                     let time_multiplier = Decimal::from(minute) / dec!(90.0);
-                    let impact = (dec!(5.0) + (dec!(10.0) * time_multiplier)) * rivalry_multiplier;
-                    club.intrinsic_value += impact;
+                    // Percent of the club's *current* value, not a flat point
+                    // add - a flat number meant identical events were worth
+                    // wildly different relative moves depending purely on a
+                    // club's absolute valuation (confirmed live: ~0.7% for a
+                    // ~2,250-value club vs. ~5.6% for a ~270-value one, same
+                    // goal). `value += value * pct` also can't drive a value
+                    // negative the way repeated flat subtractions could.
+                    let impact_pct = (dec!(0.05) + (dec!(0.10) * time_multiplier)) * rivalry_multiplier;
+                    let base_value = club.intrinsic_value;
+                    club.intrinsic_value += base_value * impact_pct;
                     club.last_match_update = current_ts;
                     club.resting_value = Some(club.intrinsic_value);
                     self.notify(EngineUpdate::Club { id: team_id, state: club.clone() });
                 }
                 if let Some(mut player) = self.player_states.get_mut(&player_id) {
                     let pos_multiplier = player.position.base_weight();
-                    let player_impact = dec!(15.0) * pos_multiplier * player.form_weight * rivalry_multiplier;
-                    player.intrinsic_value += player_impact;
+                    let player_impact_pct = dec!(0.15) * pos_multiplier * player.form_weight * rivalry_multiplier;
+                    let base_value = player.intrinsic_value;
+                    player.intrinsic_value += base_value * player_impact_pct;
                     self.notify(EngineUpdate::Player { id: player_id, state: player.clone() });
                 }
             }
             MatchEvent::RedCard { team_id, opponent_id, player_id } => {
                 let rivalry_multiplier = self.get_rivalry_multiplier(team_id, opponent_id);
                 if let Some(mut club) = self.club_states.get_mut(&team_id) {
-                    club.intrinsic_value -= dec!(7.5) * rivalry_multiplier;
+                    let base_value = club.intrinsic_value;
+                    club.intrinsic_value -= base_value * dec!(0.075) * rivalry_multiplier;
                     club.last_match_update = current_ts;
                     club.resting_value = Some(club.intrinsic_value);
                     self.notify(EngineUpdate::Club { id: team_id, state: club.clone() });
@@ -349,7 +359,8 @@ impl ValuationEngine {
             MatchEvent::YellowCard { team_id, opponent_id, player_id } => {
                 let rivalry_multiplier = self.get_rivalry_multiplier(team_id, opponent_id);
                 if let Some(mut club) = self.club_states.get_mut(&team_id) {
-                    club.intrinsic_value -= dec!(2.5) * rivalry_multiplier;
+                    let base_value = club.intrinsic_value;
+                    club.intrinsic_value -= base_value * dec!(0.025) * rivalry_multiplier;
                     club.last_match_update = current_ts;
                     club.resting_value = Some(club.intrinsic_value);
                     self.notify(EngineUpdate::Club { id: team_id, state: club.clone() });
@@ -459,26 +470,108 @@ impl ValuationEngine {
     }
 }
 
-pub trait ValuationCalculator {
-    fn calculate_base_valuation(&self, p: Decimal, f: Decimal, s: Decimal) -> Decimal;
-    fn calculate_goal_impact(&self, v_base: Decimal, t_remaining: Decimal) -> Decimal;
-}
+#[cfg(test)]
+mod event_impact_tests {
+    use super::*;
 
-impl ValuationCalculator for ValuationEngine {
-    fn calculate_base_valuation(&self, p: Decimal, f: Decimal, s: Decimal) -> Decimal {
-        let (wp, wf, ws) = if self.is_transfer_window.load(std::sync::atomic::Ordering::Relaxed) {
-            (dec!(0.10), dec!(0.80), dec!(0.10))
-        } else {
-            (dec!(0.60), dec!(0.30), dec!(0.10))
-        };
-        (wp * p) + (wf * f) + (ws * s)
+    /// Two clubs, one much smaller than the other, each with a single
+    /// player - lets a test apply the exact same event to both and compare
+    /// *relative* change, which is the one behavior this whole change
+    /// exists to fix (a flat point value made the same real event worth
+    /// wildly different percentages depending purely on a club's absolute
+    /// valuation - confirmed live: ~0.7% for a ~2,250-value club vs. ~5.6%
+    /// for a ~270-value one, same goal).
+    fn engine_with_two_clubs(small_value: Decimal, big_value: Decimal) -> (ValuationEngine, ClubId, PlayerId, ClubId, PlayerId) {
+        let engine = ValuationEngine::new();
+        let small_club = ClubId(1);
+        let big_club = ClubId(2);
+        let opponent = ClubId(3);
+
+        let mut small = ClubState::new(small_club);
+        small.intrinsic_value = small_value;
+        engine.club_states.insert(small_club, small);
+
+        let mut big = ClubState::new(big_club);
+        big.intrinsic_value = big_value;
+        engine.club_states.insert(big_club, big);
+
+        engine.club_states.insert(opponent, ClubState::new(opponent));
+
+        let small_player = PlayerId(1);
+        let big_player = PlayerId(2);
+        for (pid, club, value) in [(small_player, small_club, small_value), (big_player, big_club, big_value)] {
+            engine.player_states.insert(
+                pid,
+                PlayerValues {
+                    team_id: club,
+                    intrinsic_value: value,
+                    form_weight: dec!(1.0),
+                    sentiment_score: dec!(1.0),
+                    volatility_factor: dec!(1.0),
+                    performance_history: vec![value; 5],
+                    position: Position::CM,
+                    is_captain: false,
+                    active: true,
+                },
+            );
+        }
+        (engine, small_club, small_player, big_club, big_player)
     }
 
-    fn calculate_goal_impact(&self, v_base: Decimal, t_remaining: Decimal) -> Decimal {
-        let g = dec!(0.05);
-        let one_second = dec!(1) / dec!(60);
-        let t_rem_capped = if t_remaining < one_second { one_second } else { t_remaining };
-        v_base * (dec!(1) + (g / t_rem_capped))
+    #[test]
+    fn goal_impact_scales_with_current_club_value_not_flat() {
+        let (engine, small_club, small_player, big_club, big_player) = engine_with_two_clubs(dec!(270.0), dec!(2250.0));
+
+        engine.process_event(MatchEvent::Goal { team_id: small_club, opponent_id: ClubId(3), player_id: small_player, minute: 60 }, 0);
+        engine.process_event(MatchEvent::Goal { team_id: big_club, opponent_id: ClubId(3), player_id: big_player, minute: 60 }, 0);
+
+        let small_after = engine.club_states.get(&small_club).unwrap().intrinsic_value;
+        let big_after = engine.club_states.get(&big_club).unwrap().intrinsic_value;
+
+        let small_pct = (small_after - dec!(270.0)) / dec!(270.0);
+        let big_pct = (big_after - dec!(2250.0)) / dec!(2250.0);
+
+        assert_eq!(small_pct, big_pct, "identical goal (same minute, no rivalry) must move both clubs by the same relative percentage, regardless of their absolute value - got {small_pct} vs {big_pct}");
+        // Sanity: this is the real fix - the same goal used to be ~5.6% for
+        // the small club and ~0.7% for the big one. Now both get the same
+        // ~11.7% (0.05 + 0.10 * 60/90).
+        assert!(small_pct > dec!(0.11) && small_pct < dec!(0.12), "expected ~11.7% impact, got {small_pct}");
+    }
+
+    #[test]
+    fn goal_impact_scales_with_current_player_value_not_flat() {
+        let (engine, small_club, small_player, big_club, big_player) = engine_with_two_clubs(dec!(270.0), dec!(2250.0));
+        // Player intrinsic_value was seeded equal to club value in the
+        // helper purely for setup convenience - only the *relative* move
+        // matters for this assertion, not any relationship to club value.
+        let small_before = engine.player_states.get(&small_player).unwrap().intrinsic_value;
+        let big_before = engine.player_states.get(&big_player).unwrap().intrinsic_value;
+
+        engine.process_event(MatchEvent::Goal { team_id: small_club, opponent_id: ClubId(3), player_id: small_player, minute: 60 }, 0);
+        engine.process_event(MatchEvent::Goal { team_id: big_club, opponent_id: ClubId(3), player_id: big_player, minute: 60 }, 0);
+
+        let small_after = engine.player_states.get(&small_player).unwrap().intrinsic_value;
+        let big_after = engine.player_states.get(&big_player).unwrap().intrinsic_value;
+
+        let small_pct = (small_after - small_before) / small_before;
+        let big_pct = (big_after - big_before) / big_before;
+        assert_eq!(small_pct, big_pct, "identical goal must move both scorers by the same relative percentage - got {small_pct} vs {big_pct}");
+    }
+
+    #[test]
+    fn red_card_reduces_club_value_by_the_expected_percentage() {
+        let (engine, small_club, small_player, _big_club, _big_player) = engine_with_two_clubs(dec!(1000.0), dec!(1000.0));
+        engine.process_event(MatchEvent::RedCard { team_id: small_club, opponent_id: ClubId(3), player_id: small_player }, 0);
+        let after = engine.club_states.get(&small_club).unwrap().intrinsic_value;
+        assert_eq!(after, dec!(1000.0) * (dec!(1) - dec!(0.075)), "expected exactly a 7.5% reduction, got {after}");
+    }
+
+    #[test]
+    fn yellow_card_reduces_club_value_by_the_expected_percentage() {
+        let (engine, small_club, small_player, _big_club, _big_player) = engine_with_two_clubs(dec!(1000.0), dec!(1000.0));
+        engine.process_event(MatchEvent::YellowCard { team_id: small_club, opponent_id: ClubId(3), player_id: small_player }, 0);
+        let after = engine.club_states.get(&small_club).unwrap().intrinsic_value;
+        assert_eq!(after, dec!(1000.0) * (dec!(1) - dec!(0.025)), "expected exactly a 2.5% reduction, got {after}");
     }
 }
 

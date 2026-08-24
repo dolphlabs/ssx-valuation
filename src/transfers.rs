@@ -127,7 +127,12 @@ const PLAYER_REBLEND_RETAIN: Decimal = dec!(0.5);
 const PLAYER_REBLEND_ADOPT: Decimal = dec!(0.5);
 const LOAN_DAMPING: Decimal = dec!(0.4);
 const NEW_SIGNING_DEFAULT_VALUE: Decimal = dec!(20.0); // fallback for a brand-new player with no fee signal (undisclosed/free/loan) - roughly a fringe-squad-player level in the backfilled data
-const CLUB_FREE_OR_UNKNOWN_IMPACT: Decimal = dec!(5.0); // no fee signal - same order of magnitude as a card, not a goal
+// No fee signal - same order of magnitude as a card, not a goal (see
+// process_event's Goal/RedCard/YellowCard handling in lib.rs, which uses
+// this same percent-of-current-value convention for the same reason: a
+// flat point value means the identical event is worth wildly different
+// relative amounts depending purely on a club's absolute valuation).
+const CLUB_FREE_OR_UNKNOWN_IMPACT_PCT: Decimal = dec!(0.05);
 
 impl ValuationEngine {
     /// Applies a confirmed transfer. Club-level effects fire independent of
@@ -142,18 +147,31 @@ impl ValuationEngine {
             _ => None,
         };
         let damping = if event.kind == TransferKind::Loan { LOAN_DAMPING } else { dec!(1.0) };
-        let club_delta = fee.map(|f| f * damping).unwrap_or(CLUB_FREE_OR_UNKNOWN_IMPACT * damping);
 
+        // A real fee is a real, absolute-currency signal (e.g. an actual
+        // €45m) and applies identically to both sides, same as before this
+        // change. The no-fee-signal fallback is a synthetic placeholder,
+        // not a real number - it's computed as a percent of *each side's
+        // own* current value rather than one shared flat number, since 5%
+        // of club A's value isn't 5% of club B's.
         if let Some(to_club) = event.to {
             if let Some(mut club) = self.club_states.get_mut(&to_club) {
-                club.intrinsic_value += club_delta;
+                let delta = match fee {
+                    Some(f) => f * damping,
+                    None => club.intrinsic_value * CLUB_FREE_OR_UNKNOWN_IMPACT_PCT * damping,
+                };
+                club.intrinsic_value += delta;
                 club.last_match_update = current_ts;
                 self.notify(EngineUpdate::Club { id: to_club, state: club.clone() });
             }
         }
         if let Some(from_club) = event.from {
             if let Some(mut club) = self.club_states.get_mut(&from_club) {
-                club.intrinsic_value -= club_delta;
+                let delta = match fee {
+                    Some(f) => f * damping,
+                    None => club.intrinsic_value * CLUB_FREE_OR_UNKNOWN_IMPACT_PCT * damping,
+                };
+                club.intrinsic_value -= delta;
                 club.last_match_update = current_ts;
                 self.notify(EngineUpdate::Club { id: from_club, state: club.clone() });
             }
@@ -364,6 +382,44 @@ mod tests {
         let new_id = engine.process_transfer(event, 0);
         let player = engine.player_states.get(&new_id).unwrap();
         assert_eq!(player.intrinsic_value, NEW_SIGNING_DEFAULT_VALUE);
+    }
+
+    /// A no-fee-signal transfer's club-level impact must be a percentage of
+    /// *each side's own* current value, not one shared flat number split
+    /// between them - `engine_with_two_clubs` gives both sides an identical
+    /// starting value (100.0), which wouldn't have caught a regression to
+    /// the old shared-flat-delta behavior, so this test deliberately uses
+    /// two clubs of very different sizes instead.
+    #[test]
+    fn no_fee_signal_impact_is_a_percentage_of_each_clubs_own_value() {
+        let engine = ValuationEngine::new();
+        let seller = ClubId(1);
+        let buyer = ClubId(2);
+        let mut seller_state = ClubState::new(seller);
+        seller_state.intrinsic_value = dec!(2250.0);
+        engine.club_states.insert(seller, seller_state);
+        let mut buyer_state = ClubState::new(buyer);
+        buyer_state.intrinsic_value = dec!(270.0);
+        engine.club_states.insert(buyer, buyer_state);
+
+        let event = TransferEvent {
+            existing_player_id: None,
+            player_name: "Unknown Fee Signing".into(),
+            position_bucket: PositionBucket::Def,
+            from: Some(seller),
+            to: Some(buyer),
+            kind: TransferKind::Free,
+        };
+        engine.process_transfer(event, 0);
+
+        let seller_after = engine.club_states.get(&seller).unwrap().intrinsic_value;
+        let buyer_after = engine.club_states.get(&buyer).unwrap().intrinsic_value;
+
+        // Each side moves by 5% of its *own* pre-transfer value - not a
+        // shared flat number (the old bug) and not 5% of the other side's
+        // value either.
+        assert_eq!(seller_after, dec!(2250.0) * (dec!(1) - dec!(0.05)), "seller should lose 5% of its own value, got {seller_after}");
+        assert_eq!(buyer_after, dec!(270.0) * (dec!(1) + dec!(0.05)), "buyer should gain 5% of its own value, got {buyer_after}");
     }
 
     #[test]
