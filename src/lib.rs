@@ -215,7 +215,17 @@ impl ClubState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum EngineUpdate {
     Player { id: PlayerId, state: PlayerValues },
-    Club { id: ClubId, state: ClubState },
+    /// `ts` is when this update was produced - deliberately *not* the same
+    /// thing as `state.last_match_update` (which only advances on a real
+    /// match event: Goal/Card/WhistleEnd/AdminCorrection/Transfer, never on
+    /// ambient Heartbeat noise). Live price-history consumers
+    /// (`ssx-node::storage`, `ssx-executor::pubsub`) need a timestamp that's
+    /// always fresh, including for a club that hasn't played in weeks but is
+    /// still getting heartbeat ticks - that's what this field is for.
+    /// Carried on `EngineUpdate` itself (not `ClubState`) since this is only
+    /// ever live-broadcast, never persisted, so it needs no serde-migration
+    /// story the way `resting_value` did.
+    Club { id: ClubId, state: ClubState, ts: u64 },
     Event { event: MatchEvent, ts: u64 },
     CandleUpdate { 
         base_id: ClubId, 
@@ -288,12 +298,24 @@ impl ValuationEngine {
     /// caller: ~50% of the gap closes over 2 weeks of continued inactivity.
     /// Never touches `last_match_update` itself - only a real event does
     /// that - so this stays idempotent no matter how often it's called.
+    ///
+    /// `current_ts` must be **milliseconds**, matching every real-event
+    /// producer (`as_millis()` in the heartbeat/transfer/injury/live-oracle/
+    /// admin-correction loops) and `last_match_update` itself - the caller
+    /// previously passed seconds (`DateTime::timestamp()`), which meant this
+    /// gate compared a seconds-scale `current_ts` against a milliseconds-
+    /// scale `last_match_update + SEVEN_DAYS_MS`, i.e. `current_ts` was
+    /// always ~1000x smaller than the right-hand side - permanently false,
+    /// so this function never actually fired in production regardless of
+    /// the Heartbeat-freshness issue above. Confirmed by reading the actual
+    /// caller (`ssx-node/src/main.rs`'s maintenance loop) - now fixed there
+    /// to pass `timestamp_millis()`.
     pub fn apply_stale_club_reversion(&self, current_ts: u64) {
-        const SEVEN_DAYS_SECS: u64 = 7 * 24 * 60 * 60;
+        const SEVEN_DAYS_MS: u64 = 7 * 24 * 60 * 60 * 1000;
         const PULL_FRACTION: Decimal = dec!(0.002);
 
         for mut club in self.club_states.iter_mut() {
-            if current_ts <= club.last_match_update + SEVEN_DAYS_SECS {
+            if current_ts <= club.last_match_update + SEVEN_DAYS_MS {
                 continue;
             }
             let Some(resting_value) = club.resting_value else { continue };
@@ -302,7 +324,66 @@ impl ValuationEngine {
                 continue;
             }
             club.intrinsic_value += gap * PULL_FRACTION;
-            self.notify(EngineUpdate::Club { id: club.id, state: club.clone() });
+            self.notify(EngineUpdate::Club { id: club.id, state: club.clone(), ts: current_ts });
+        }
+    }
+
+    /// Ripples a club's own real value movement out to every OTHER club
+    /// that has `mover_id` explicitly listed in *its own* `rivals` - even
+    /// when that observer isn't playing in this match at all (e.g. Real
+    /// Madrid having a big night should nudge Barcelona too). Opposite sign
+    /// of the mover's own move, damped, and weighted by the *observer's*
+    /// own configured factor toward the mover - not the mover's factor
+    /// toward them, since `rivals` isn't reliably symmetric in real seed
+    /// data (confirmed: several one-directional-only pairs, several
+    /// asymmetric-value pairs). A club with no configured entry for the
+    /// mover gets exactly zero spillover - deliberately opt-in via the
+    /// sparse `rivals` list itself, not a neutral default the way the
+    /// direct-effect multiplier is (that one *has* to have some value,
+    /// since the two match participants are definitely playing each other;
+    /// spillover isn't owed to anyone who hasn't said they care).
+    ///
+    /// `signed_delta_pct` is the mover's own already-realized, signed move
+    /// (e.g. `+impact_pct` for a scorer, after the scorer's own rivalry
+    /// multiplier is already baked in) - the real signal that ripples out,
+    /// not some hypothetical unmultiplied base. `exclude_id` is the other
+    /// participant already in this same event, so it never double-dips as
+    /// an outside "reactor" on top of its own direct mirrored move.
+    ///
+    /// Deliberately single-hop only: a reactor's own resulting move never
+    /// triggers a second round of spillover to *its* rivals - only ever
+    /// called from Goal/RedCard/YellowCard's direct movement sites, never
+    /// from within this function itself. Prevents runaway cascades through
+    /// rivalry chains or cycles. Does not touch `last_match_update`/
+    /// `resting_value` for the reactor - spillover isn't the reactor's own
+    /// real match activity, and touching either would incorrectly suppress
+    /// `apply_stale_club_reversion` for a club that hasn't actually played,
+    /// just because a rival did.
+    fn apply_rivalry_spillover(&self, mover_id: ClubId, exclude_id: ClubId, signed_delta_pct: Decimal, current_ts: u64) {
+        const SPILLOVER_DAMPING: Decimal = dec!(0.2);
+
+        if signed_delta_pct == Decimal::ZERO {
+            return;
+        }
+
+        // Snapshot first (immutable scan, no get_mut held), then mutate one
+        // at a time - same pattern WhistleEnd uses to collect player ids
+        // before looping get_mut. Must only be called with the mover's own
+        // get_mut guard already dropped, or this deadlocks on its shard.
+        let reactors: Vec<(ClubId, Decimal)> = self
+            .club_states
+            .iter()
+            .filter(|entry| *entry.key() != mover_id && *entry.key() != exclude_id)
+            .filter_map(|entry| entry.value().rivals.iter().find(|(rid, _)| *rid == mover_id).map(|(_, w)| (*entry.key(), *w)))
+            .collect();
+
+        for (reactor_id, weight) in reactors {
+            if let Some(mut reactor) = self.club_states.get_mut(&reactor_id) {
+                let reactor_delta_pct = -signed_delta_pct * SPILLOVER_DAMPING * weight;
+                let base_value = reactor.intrinsic_value;
+                reactor.intrinsic_value += base_value * reactor_delta_pct;
+                self.notify(EngineUpdate::Club { id: reactor_id, state: reactor.clone(), ts: current_ts });
+            }
         }
     }
 
@@ -326,16 +407,26 @@ impl ValuationEngine {
                 // ~2,250-value club vs. ~5.6% for a ~270-value one, same
                 // goal). `value += value * pct` also can't drive a value
                 // negative the way repeated flat subtractions could.
-                let base_impact_pct = dec!(0.05) + (dec!(0.10) * time_multiplier);
+                // Halved from the original 0.05/0.10 once goals became
+                // mirrored (both sides move) - the effective spread-swing
+                // had roughly doubled, and a multi-goal rout was compounding
+                // to 60-70%+. This restores close to the pre-mirroring
+                // spread magnitude even under real multi-goal compounding
+                // (confirmed by modeling a 5-0 blowout both ways), not just
+                // a linear approximation.
+                let base_impact_pct = dec!(0.025) + (dec!(0.05) * time_multiplier);
 
+                let mut scorer_impact_pct = Decimal::ZERO;
                 if let Some(mut club) = self.club_states.get_mut(&team_id) {
-                    let impact_pct = base_impact_pct * scorer_rivalry_multiplier;
+                    scorer_impact_pct = base_impact_pct * scorer_rivalry_multiplier;
                     let base_value = club.intrinsic_value;
-                    club.intrinsic_value += base_value * impact_pct;
+                    club.intrinsic_value += base_value * scorer_impact_pct;
                     club.last_match_update = current_ts;
                     club.resting_value = Some(club.intrinsic_value);
-                    self.notify(EngineUpdate::Club { id: team_id, state: club.clone() });
+                    self.notify(EngineUpdate::Club { id: team_id, state: club.clone(), ts: current_ts });
                 }
+                self.apply_rivalry_spillover(team_id, opponent_id, scorer_impact_pct, current_ts);
+
                 // Conceding is real, negative signal too - a goal used to
                 // only ever pump the scorer and leave the conceding club
                 // completely untouched, which meant a win had unbounded
@@ -348,14 +439,17 @@ impl ValuationEngine {
                 // since each side's reaction is sized by how much *they*
                 // care about this fixture.
                 let conceder_rivalry_multiplier = self.get_rivalry_multiplier(opponent_id, team_id);
+                let mut conceder_impact_pct = Decimal::ZERO;
                 if let Some(mut opponent_club) = self.club_states.get_mut(&opponent_id) {
-                    let impact_pct = base_impact_pct * conceder_rivalry_multiplier;
+                    conceder_impact_pct = base_impact_pct * conceder_rivalry_multiplier;
                     let base_value = opponent_club.intrinsic_value;
-                    opponent_club.intrinsic_value -= base_value * impact_pct;
+                    opponent_club.intrinsic_value -= base_value * conceder_impact_pct;
                     opponent_club.last_match_update = current_ts;
                     opponent_club.resting_value = Some(opponent_club.intrinsic_value);
-                    self.notify(EngineUpdate::Club { id: opponent_id, state: opponent_club.clone() });
+                    self.notify(EngineUpdate::Club { id: opponent_id, state: opponent_club.clone(), ts: current_ts });
                 }
+                self.apply_rivalry_spillover(opponent_id, team_id, -conceder_impact_pct, current_ts);
+
                 if let Some(mut player) = self.player_states.get_mut(&player_id) {
                     let pos_multiplier = player.position.base_weight();
                     let player_impact_pct = dec!(0.15) * pos_multiplier * player.form_weight * scorer_rivalry_multiplier;
@@ -366,13 +460,17 @@ impl ValuationEngine {
             }
             MatchEvent::RedCard { team_id, opponent_id, player_id } => {
                 let carded_rivalry_multiplier = self.get_rivalry_multiplier(team_id, opponent_id);
+                let mut carded_impact_pct = Decimal::ZERO;
                 if let Some(mut club) = self.club_states.get_mut(&team_id) {
+                    carded_impact_pct = dec!(0.075) * carded_rivalry_multiplier;
                     let base_value = club.intrinsic_value;
-                    club.intrinsic_value -= base_value * dec!(0.075) * carded_rivalry_multiplier;
+                    club.intrinsic_value -= base_value * carded_impact_pct;
                     club.last_match_update = current_ts;
                     club.resting_value = Some(club.intrinsic_value);
-                    self.notify(EngineUpdate::Club { id: team_id, state: club.clone() });
+                    self.notify(EngineUpdate::Club { id: team_id, state: club.clone(), ts: current_ts });
                 }
+                self.apply_rivalry_spillover(team_id, opponent_id, -carded_impact_pct, current_ts);
+
                 // A red card against the opponent is real positive signal
                 // too - down a player is a genuine disadvantage for them,
                 // which reads as good news for the other side. Mirrors the
@@ -380,13 +478,17 @@ impl ValuationEngine {
                 // scaled by the *benefiting* club's own rivalry factor
                 // toward the carded team.
                 let benefiting_rivalry_multiplier = self.get_rivalry_multiplier(opponent_id, team_id);
+                let mut benefiting_impact_pct = Decimal::ZERO;
                 if let Some(mut opponent_club) = self.club_states.get_mut(&opponent_id) {
+                    benefiting_impact_pct = dec!(0.075) * benefiting_rivalry_multiplier;
                     let base_value = opponent_club.intrinsic_value;
-                    opponent_club.intrinsic_value += base_value * dec!(0.075) * benefiting_rivalry_multiplier;
+                    opponent_club.intrinsic_value += base_value * benefiting_impact_pct;
                     opponent_club.last_match_update = current_ts;
                     opponent_club.resting_value = Some(opponent_club.intrinsic_value);
-                    self.notify(EngineUpdate::Club { id: opponent_id, state: opponent_club.clone() });
+                    self.notify(EngineUpdate::Club { id: opponent_id, state: opponent_club.clone(), ts: current_ts });
                 }
+                self.apply_rivalry_spillover(opponent_id, team_id, benefiting_impact_pct, current_ts);
+
                 if let Some(mut player) = self.player_states.get_mut(&player_id) {
                     player.form_weight *= dec!(0.5);
                     self.notify(EngineUpdate::Player { id: player_id, state: player.clone() });
@@ -394,23 +496,31 @@ impl ValuationEngine {
             }
             MatchEvent::YellowCard { team_id, opponent_id, player_id } => {
                 let carded_rivalry_multiplier = self.get_rivalry_multiplier(team_id, opponent_id);
+                let mut carded_impact_pct = Decimal::ZERO;
                 if let Some(mut club) = self.club_states.get_mut(&team_id) {
+                    carded_impact_pct = dec!(0.025) * carded_rivalry_multiplier;
                     let base_value = club.intrinsic_value;
-                    club.intrinsic_value -= base_value * dec!(0.025) * carded_rivalry_multiplier;
+                    club.intrinsic_value -= base_value * carded_impact_pct;
                     club.last_match_update = current_ts;
                     club.resting_value = Some(club.intrinsic_value);
-                    self.notify(EngineUpdate::Club { id: team_id, state: club.clone() });
+                    self.notify(EngineUpdate::Club { id: team_id, state: club.clone(), ts: current_ts });
                 }
+                self.apply_rivalry_spillover(team_id, opponent_id, -carded_impact_pct, current_ts);
+
                 // Same mirrored-benefit reasoning as RedCard above, scaled
                 // to the yellow-card magnitude.
                 let benefiting_rivalry_multiplier = self.get_rivalry_multiplier(opponent_id, team_id);
+                let mut benefiting_impact_pct = Decimal::ZERO;
                 if let Some(mut opponent_club) = self.club_states.get_mut(&opponent_id) {
+                    benefiting_impact_pct = dec!(0.025) * benefiting_rivalry_multiplier;
                     let base_value = opponent_club.intrinsic_value;
-                    opponent_club.intrinsic_value += base_value * dec!(0.025) * benefiting_rivalry_multiplier;
+                    opponent_club.intrinsic_value += base_value * benefiting_impact_pct;
                     opponent_club.last_match_update = current_ts;
                     opponent_club.resting_value = Some(opponent_club.intrinsic_value);
-                    self.notify(EngineUpdate::Club { id: opponent_id, state: opponent_club.clone() });
+                    self.notify(EngineUpdate::Club { id: opponent_id, state: opponent_club.clone(), ts: current_ts });
                 }
+                self.apply_rivalry_spillover(opponent_id, team_id, benefiting_impact_pct, current_ts);
+
                 if let Some(mut player) = self.player_states.get_mut(&player_id) {
                     player.form_weight *= dec!(0.9);
                     self.notify(EngineUpdate::Player { id: player_id, state: player.clone() });
@@ -429,7 +539,7 @@ impl ValuationEngine {
                     if let Some(mut club) = self.club_states.get_mut(&team_id) {
                         club.last_match_update = current_ts;
                         club.resting_value = Some(club.intrinsic_value);
-                        self.notify(EngineUpdate::Club { id: team_id, state: club.clone() });
+                        self.notify(EngineUpdate::Club { id: team_id, state: club.clone(), ts: current_ts });
                     }
                     
                         let pids: Vec<PlayerId> = self.player_states.iter()
@@ -468,7 +578,16 @@ impl ValuationEngine {
             }
             MatchEvent::Heartbeat { team_id, tick_std_pct } => {
                 if let Some(mut club) = self.club_states.get_mut(&team_id) {
-                    club.last_match_update = current_ts;
+                    // Deliberately NOT touching last_match_update here -
+                    // Heartbeat fires for every club every ~2s regardless of
+                    // real match activity, so stamping it here meant
+                    // apply_stale_club_reversion's "hasn't had a real event
+                    // in 7 days" gate could never open in practice (confirmed
+                    // live: it was permanently unreachable). last_match_update
+                    // is reserved for real events (Goal/Card/WhistleEnd/
+                    // AdminCorrection/Transfer) - see EngineUpdate::Club's
+                    // own `ts` field for the "always fresh, every tick"
+                    // timestamp live price-history storage actually needs.
 
                     // Live Market Simulation: driftless geometric random walk -
                     // see heartbeat_multiplier's own comment for why this must
@@ -487,7 +606,7 @@ impl ValuationEngine {
                         club.intrinsic_value *= heartbeat_multiplier(shock);
                     }
 
-                    self.notify(EngineUpdate::Club { id: team_id, state: club.clone() });
+                    self.notify(EngineUpdate::Club { id: team_id, state: club.clone(), ts: current_ts });
                 }
             }
             MatchEvent::AdminCorrection { team_id, delta_pct } => {
@@ -499,7 +618,7 @@ impl ValuationEngine {
                     // apply_stale_club_reversion has no stale target to
                     // fight this back toward.
                     club.resting_value = Some(club.intrinsic_value);
-                    self.notify(EngineUpdate::Club { id: team_id, state: club.clone() });
+                    self.notify(EngineUpdate::Club { id: team_id, state: club.clone(), ts: current_ts });
                 }
             }
         }
@@ -580,8 +699,11 @@ mod event_impact_tests {
         assert_eq!(small_pct, big_pct, "identical goal (same minute, no rivalry) must move both clubs by the same relative percentage, regardless of their absolute value - got {small_pct} vs {big_pct}");
         // Sanity: this is the real fix - the same goal used to be ~5.6% for
         // the small club and ~0.7% for the big one. Now both get the same
-        // ~11.7% (0.05 + 0.10 * 60/90).
-        assert!(small_pct > dec!(0.11) && small_pct < dec!(0.12), "expected ~11.7% impact, got {small_pct}");
+        // ~5.83% (0.025 + 0.05 * 60/90) - halved from the original 0.05/0.10
+        // once goals became mirrored (see goal_also_moves_the_conceding_
+        // club_down_by_the_mirrored_percentage), so the effective spread
+        // magnitude stays where it was pre-mirroring.
+        assert!(small_pct > dec!(0.058) && small_pct < dec!(0.059), "expected ~5.83% impact, got {small_pct}");
     }
 
     #[test]
@@ -636,7 +758,7 @@ mod event_impact_tests {
 
         // No rivalry configured between these two, so both sides use a 1.0x
         // multiplier - the move should be an exact mirror image.
-        let expected_pct = dec!(0.05) + (dec!(0.10) * dec!(60.0) / dec!(90.0));
+        let expected_pct = dec!(0.025) + (dec!(0.05) * dec!(60.0) / dec!(90.0));
         assert_eq!(scorer_after, dec!(1000.0) * (dec!(1) + expected_pct), "scorer should be up by exactly {expected_pct}, got {scorer_after}");
         assert_eq!(conceder_after, dec!(1000.0) * (dec!(1) - expected_pct), "conceder should be down by exactly {expected_pct}, got {conceder_after}");
     }
@@ -675,9 +797,155 @@ mod event_impact_tests {
         let scorer_after = engine.club_states.get(&scorer).unwrap().intrinsic_value;
         let conceder_after = engine.club_states.get(&conceder).unwrap().intrinsic_value;
 
-        let base_pct = dec!(0.05) + (dec!(0.10) * dec!(60.0) / dec!(90.0));
+        let base_pct = dec!(0.025) + (dec!(0.05) * dec!(60.0) / dec!(90.0));
         assert_eq!(scorer_after, dec!(1000.0) * (dec!(1) + base_pct * dec!(2.0)), "scorer's own 2.0x rivalry factor should apply to its own move");
         assert_eq!(conceder_after, dec!(1000.0) * (dec!(1) - base_pct), "conceder has no configured factor, so its move should stay at the 1.0x default, not inherit the scorer's 2.0x");
+    }
+
+    #[test]
+    fn goal_ripples_to_a_non_participant_rival_with_opposite_sign() {
+        let (engine, scorer, scorer_player, conceder, _conceder_player) = engine_with_two_clubs(dec!(1000.0), dec!(1000.0));
+        let reactor = ClubId(99);
+        let mut reactor_state = ClubState::new(reactor);
+        reactor_state.intrinsic_value = dec!(1000.0);
+        reactor_state.set_rival_factor(scorer, dec!(1.5));
+        engine.club_states.insert(reactor, reactor_state);
+
+        engine.process_event(MatchEvent::Goal { team_id: scorer, opponent_id: conceder, player_id: scorer_player, minute: 60 }, 0);
+
+        let scorer_impact_pct = dec!(0.025) + (dec!(0.05) * dec!(60.0) / dec!(90.0));
+        let reactor_after = engine.club_states.get(&reactor).unwrap().intrinsic_value;
+        let expected_reactor_pct = -(scorer_impact_pct * dec!(0.2) * dec!(1.5));
+        assert_eq!(
+            reactor_after,
+            dec!(1000.0) * (dec!(1) + expected_reactor_pct),
+            "a non-participant rival should move opposite the scorer, damped and weighted by its own configured factor"
+        );
+    }
+
+    #[test]
+    fn no_spillover_for_a_club_with_no_configured_rivalry_toward_the_mover() {
+        let (engine, scorer, scorer_player, conceder, _conceder_player) = engine_with_two_clubs(dec!(1000.0), dec!(1000.0));
+        let bystander = ClubId(99);
+        let mut bystander_state = ClubState::new(bystander);
+        bystander_state.intrinsic_value = dec!(1000.0);
+        // Deliberately no set_rival_factor call - bystander has no
+        // configured opinion about the scorer at all.
+        engine.club_states.insert(bystander, bystander_state);
+
+        engine.process_event(MatchEvent::Goal { team_id: scorer, opponent_id: conceder, player_id: scorer_player, minute: 60 }, 0);
+
+        let bystander_after = engine.club_states.get(&bystander).unwrap().intrinsic_value;
+        assert_eq!(bystander_after, dec!(1000.0), "a club with no rivals entry for the mover must get exactly zero spillover, not a neutral-default nudge");
+    }
+
+    #[test]
+    fn match_participant_never_double_dips_as_an_outside_spillover_reactor() {
+        // The conceder's own configured factor toward the scorer already
+        // powers its direct mirrored move (get_rivalry_multiplier(conceder,
+        // scorer)) - the exclude_id filter must stop that *same* rivals
+        // entry from also being picked up a second time by the reactor
+        // scan and applying an extra spillover term on top. Expected value
+        // uses the 1.5x multiplier since it genuinely does apply once, to
+        // the direct move - proving there's no *second*, additional term.
+        let (engine, scorer, scorer_player, conceder, _conceder_player) = engine_with_two_clubs(dec!(1000.0), dec!(1000.0));
+        {
+            let mut conceder_state = engine.club_states.get_mut(&conceder).unwrap();
+            conceder_state.set_rival_factor(scorer, dec!(1.5));
+        }
+
+        engine.process_event(MatchEvent::Goal { team_id: scorer, opponent_id: conceder, player_id: scorer_player, minute: 60 }, 0);
+
+        let base_impact_pct = dec!(0.025) + (dec!(0.05) * dec!(60.0) / dec!(90.0));
+        let conceder_direct_impact_pct = base_impact_pct * dec!(1.5); // conceder's own 1.5x factor, applied once
+        let conceder_after = engine.club_states.get(&conceder).unwrap().intrinsic_value;
+        assert_eq!(
+            conceder_after,
+            dec!(1000.0) * (dec!(1) - conceder_direct_impact_pct),
+            "the match's own opponent must never also receive spillover on top of its direct mirrored move"
+        );
+    }
+
+    #[test]
+    fn reactor_configured_against_both_match_participants_gets_two_independent_spillovers() {
+        let (engine, scorer, scorer_player, conceder, _conceder_player) = engine_with_two_clubs(dec!(1000.0), dec!(1000.0));
+        let reactor = ClubId(99);
+        let mut reactor_state = ClubState::new(reactor);
+        reactor_state.intrinsic_value = dec!(1000.0);
+        reactor_state.set_rival_factor(scorer, dec!(1.5));
+        reactor_state.set_rival_factor(conceder, dec!(1.2));
+        engine.club_states.insert(reactor, reactor_state);
+
+        engine.process_event(MatchEvent::Goal { team_id: scorer, opponent_id: conceder, player_id: scorer_player, minute: 60 }, 0);
+
+        let impact_pct = dec!(0.025) + (dec!(0.05) * dec!(60.0) / dec!(90.0));
+        let reactor_after = engine.club_states.get(&reactor).unwrap().intrinsic_value;
+        // Two independent, sequential percent-of-current-value moves (same
+        // "value * pct of whatever it currently is" convention as
+        // everything else here), not deduped or combined into one delta:
+        // the scorer's spillover (reactor down) lands first, then the
+        // conceder's spillover (reactor up) compounds on top of that.
+        let after_scorer_spillover = dec!(1000.0) * (dec!(1) - impact_pct * dec!(0.2) * dec!(1.5));
+        let expected = after_scorer_spillover * (dec!(1) + impact_pct * dec!(0.2) * dec!(1.2));
+        assert_eq!(
+            reactor_after, expected,
+            "a club rivaling both match participants should get two independent, opposite-signed spillovers, not be deduped"
+        );
+    }
+
+    #[test]
+    fn spillover_uses_the_movers_fully_realized_delta_and_the_reactors_own_weight_stacked() {
+        // Both the mover's own rivalry multiplier (toward its real
+        // opponent) and the reactor's own weight (toward the mover) are
+        // != 1.0 together - confirms they stack multiplicatively rather
+        // than one silently overriding the other.
+        let (engine, scorer, scorer_player, conceder, _conceder_player) = engine_with_two_clubs(dec!(1000.0), dec!(1000.0));
+        {
+            let mut scorer_state = engine.club_states.get_mut(&scorer).unwrap();
+            scorer_state.set_rival_factor(conceder, dec!(1.5)); // scorer's real rivalry with its actual opponent
+        }
+        let reactor = ClubId(99);
+        let mut reactor_state = ClubState::new(reactor);
+        reactor_state.intrinsic_value = dec!(1000.0);
+        reactor_state.set_rival_factor(scorer, dec!(1.3)); // reactor's own weight toward the mover
+        engine.club_states.insert(reactor, reactor_state);
+
+        engine.process_event(MatchEvent::Goal { team_id: scorer, opponent_id: conceder, player_id: scorer_player, minute: 60 }, 0);
+
+        let base_impact_pct = dec!(0.025) + (dec!(0.05) * dec!(60.0) / dec!(90.0));
+        let scorer_realized_pct = base_impact_pct * dec!(1.5); // scorer's own multiplier already baked in
+        let reactor_after = engine.club_states.get(&reactor).unwrap().intrinsic_value;
+        let expected_reactor_pct = -(scorer_realized_pct * dec!(0.2) * dec!(1.3));
+        assert_eq!(
+            reactor_after,
+            dec!(1000.0) * (dec!(1) + expected_reactor_pct),
+            "spillover must use the mover's fully-realized (already-multiplied) delta, stacked with the reactor's own weight"
+        );
+    }
+
+    #[test]
+    fn spillover_does_not_cascade_to_a_second_hop() {
+        // A rival of the spillover-affected reactor (not of the actual
+        // mover) must feel nothing - spillover only ever fires from the
+        // real event's direct participants, never recursively from a
+        // reactor's own resulting move.
+        let (engine, scorer, scorer_player, conceder, _conceder_player) = engine_with_two_clubs(dec!(1000.0), dec!(1000.0));
+        let reactor = ClubId(98);
+        let mut reactor_state = ClubState::new(reactor);
+        reactor_state.intrinsic_value = dec!(1000.0);
+        reactor_state.set_rival_factor(scorer, dec!(1.5));
+        engine.club_states.insert(reactor, reactor_state);
+
+        let second_hop = ClubId(97);
+        let mut second_hop_state = ClubState::new(second_hop);
+        second_hop_state.intrinsic_value = dec!(1000.0);
+        second_hop_state.set_rival_factor(reactor, dec!(1.5)); // rivals the REACTOR, not the mover
+        engine.club_states.insert(second_hop, second_hop_state);
+
+        engine.process_event(MatchEvent::Goal { team_id: scorer, opponent_id: conceder, player_id: scorer_player, minute: 60 }, 0);
+
+        let second_hop_after = engine.club_states.get(&second_hop).unwrap().intrinsic_value;
+        assert_eq!(second_hop_after, dec!(1000.0), "a rival of the spillover-affected reactor must feel nothing - single-hop only");
     }
 }
 
@@ -915,7 +1183,7 @@ mod admin_correction_tests {
 mod stale_club_reversion_tests {
     use super::*;
 
-    const SEVEN_DAYS_SECS: u64 = 7 * 24 * 60 * 60;
+    const SEVEN_DAYS_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
     fn club_with(intrinsic_value: Decimal, resting_value: Decimal, last_match_update: u64) -> (ValuationEngine, ClubId) {
         let engine = ValuationEngine::new();
@@ -933,7 +1201,7 @@ mod stale_club_reversion_tests {
     #[test]
     fn pulls_down_toward_resting_value_when_above_it() {
         let (engine, club_id) = club_with(dec!(120.0), dec!(100.0), 0);
-        engine.apply_stale_club_reversion(SEVEN_DAYS_SECS + 3600);
+        engine.apply_stale_club_reversion(SEVEN_DAYS_MS + 3_600_000);
         let value = engine.club_states.get(&club_id).unwrap().intrinsic_value;
         assert!(value < dec!(120.0) && value > dec!(100.0), "expected a partial pull down toward 100.0, got {value}");
     }
@@ -945,7 +1213,7 @@ mod stale_club_reversion_tests {
     #[test]
     fn pulls_up_toward_resting_value_when_below_it() {
         let (engine, club_id) = club_with(dec!(80.0), dec!(100.0), 0);
-        engine.apply_stale_club_reversion(SEVEN_DAYS_SECS + 3600);
+        engine.apply_stale_club_reversion(SEVEN_DAYS_MS + 3_600_000);
         let value = engine.club_states.get(&club_id).unwrap().intrinsic_value;
         assert!(value > dec!(80.0) && value < dec!(100.0), "expected a partial pull up toward 100.0, got {value}");
     }
@@ -953,7 +1221,7 @@ mod stale_club_reversion_tests {
     #[test]
     fn does_nothing_within_the_seven_day_grace_period() {
         let (engine, club_id) = club_with(dec!(120.0), dec!(100.0), 0);
-        engine.apply_stale_club_reversion(SEVEN_DAYS_SECS - 3600); // one hour short of the gate
+        engine.apply_stale_club_reversion(SEVEN_DAYS_MS - 3_600_000); // one hour short of the gate
         let value = engine.club_states.get(&club_id).unwrap().intrinsic_value;
         assert_eq!(value, dec!(120.0));
     }
@@ -961,7 +1229,7 @@ mod stale_club_reversion_tests {
     #[test]
     fn does_nothing_once_already_at_the_resting_value() {
         let (engine, club_id) = club_with(dec!(100.0), dec!(100.0), 0);
-        engine.apply_stale_club_reversion(SEVEN_DAYS_SECS + 3600);
+        engine.apply_stale_club_reversion(SEVEN_DAYS_MS + 3_600_000);
         let value = engine.club_states.get(&club_id).unwrap().intrinsic_value;
         assert_eq!(value, dec!(100.0));
     }
@@ -975,7 +1243,7 @@ mod stale_club_reversion_tests {
         let (engine, club_id) = club_with(dec!(120.0), dec!(100.0), 0);
         let mut last_value = dec!(120.0);
         for _ in 0..5 {
-            engine.apply_stale_club_reversion(SEVEN_DAYS_SECS + 3600);
+            engine.apply_stale_club_reversion(SEVEN_DAYS_MS + 3_600_000);
             let value = engine.club_states.get(&club_id).unwrap().intrinsic_value;
             assert!(value < last_value, "expected continued convergence toward 100.0, got {value} after {last_value}");
             last_value = value;
@@ -986,9 +1254,74 @@ mod stale_club_reversion_tests {
     fn a_club_with_no_resting_value_yet_is_left_untouched() {
         let (engine, club_id) = club_with(dec!(120.0), dec!(100.0), 0);
         engine.club_states.get_mut(&club_id).unwrap().resting_value = None; // simulates a pre-migration Redis record
-        engine.apply_stale_club_reversion(SEVEN_DAYS_SECS + 3600);
+        engine.apply_stale_club_reversion(SEVEN_DAYS_MS + 3_600_000);
         let value = engine.club_states.get(&club_id).unwrap().intrinsic_value;
         assert_eq!(value, dec!(120.0));
+    }
+
+    /// Regression test for a real production bug: the caller
+    /// (`ssx-node`'s maintenance loop) used to pass **seconds**
+    /// (`DateTime::timestamp()`) while `last_match_update` and every real-
+    /// event producer use **milliseconds** (`as_millis()`), so this gate
+    /// compared a seconds-scale `current_ts` against a milliseconds-scale
+    /// `last_match_update + SEVEN_DAYS_MS` - always false, so this function
+    /// never fired in production regardless of real inactivity. The tests
+    /// above use small, internally-consistent synthetic timestamps that
+    /// stay correct under either unit convention and would NOT have caught
+    /// that bug (or a regression of it) - this test uses timestamps at the
+    /// actual epoch-millisecond scale `SystemTime::now()...as_millis()`
+    /// really produces, which only lines up correctly if the caller is
+    /// genuinely passing milliseconds.
+    #[test]
+    fn fires_correctly_at_realistic_epoch_millisecond_scale() {
+        // A real millisecond epoch timestamp (some arbitrary moment), not a
+        // small offset-from-zero synthetic value.
+        const REALISTIC_NOW_MS: u64 = 1_787_000_000_000;
+        let (engine, club_id) = club_with(dec!(120.0), dec!(100.0), REALISTIC_NOW_MS - SEVEN_DAYS_MS - 3_600_000);
+        engine.apply_stale_club_reversion(REALISTIC_NOW_MS);
+        let value = engine.club_states.get(&club_id).unwrap().intrinsic_value;
+        assert!(
+            value < dec!(120.0),
+            "a club whose last real event was over 7 real days before `current_ts` (both at realistic millisecond-epoch scale) should have been pulled down toward resting_value, got {value} unchanged"
+        );
+    }
+}
+
+#[cfg(test)]
+mod heartbeat_publish_timestamp_tests {
+    use super::*;
+
+    /// A Heartbeat-only club (no real match event) must still get a fresh
+    /// `EngineUpdate::Club.ts` on every tick - this is the field live price-
+    /// history storage (`ssx-node::storage`, `ssx-executor::pubsub`) reads,
+    /// specifically so removing Heartbeat's old `last_match_update` write
+    /// (see the Heartbeat handler's own comment) doesn't silently freeze
+    /// live price timestamps for a club that hasn't played in weeks.
+    #[test]
+    fn heartbeat_tick_publishes_a_fresh_ts_without_touching_last_match_update() {
+        let mut engine = ValuationEngine::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        engine.set_update_channel(tx);
+
+        let club_id = ClubId(1);
+        engine.club_states.insert(club_id, ClubState::new(club_id));
+
+        engine.process_event(MatchEvent::Heartbeat { team_id: club_id, tick_std_pct: 0.0 }, 555_000);
+
+        let club = engine.club_states.get(&club_id).unwrap();
+        assert_eq!(club.last_match_update, 0, "Heartbeat must not touch last_match_update - only a real event does");
+        drop(club);
+
+        let mut saw_fresh_club_ts = false;
+        while let Ok(update) = rx.try_recv() {
+            if let EngineUpdate::Club { id, ts, .. } = update {
+                if id == club_id {
+                    assert_eq!(ts, 555_000, "EngineUpdate::Club.ts should carry the tick's own current_ts even though last_match_update didn't move");
+                    saw_fresh_club_ts = true;
+                }
+            }
+        }
+        assert!(saw_fresh_club_ts, "expected a Club update to have been published for this Heartbeat tick");
     }
 }
 

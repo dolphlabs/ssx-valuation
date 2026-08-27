@@ -162,7 +162,11 @@ impl ValuationEngine {
                 };
                 club.intrinsic_value += delta;
                 club.last_match_update = current_ts;
-                self.notify(EngineUpdate::Club { id: to_club, state: club.clone() });
+                // Same reasoning as every other real-event handler - anchor
+                // resting_value so apply_stale_club_reversion has no stale
+                // (pre-transfer) target to pull this club back toward.
+                club.resting_value = Some(club.intrinsic_value);
+                self.notify(EngineUpdate::Club { id: to_club, state: club.clone(), ts: current_ts });
             }
         }
         if let Some(from_club) = event.from {
@@ -173,7 +177,8 @@ impl ValuationEngine {
                 };
                 club.intrinsic_value -= delta;
                 club.last_match_update = current_ts;
-                self.notify(EngineUpdate::Club { id: from_club, state: club.clone() });
+                club.resting_value = Some(club.intrinsic_value);
+                self.notify(EngineUpdate::Club { id: from_club, state: club.clone(), ts: current_ts });
             }
         }
 
@@ -268,6 +273,30 @@ mod tests {
         assert_eq!(parse_transfer_kind("N/A"), TransferKind::Permanent { fee: None });
         assert_eq!(parse_transfer_kind("Transfer"), TransferKind::Permanent { fee: None }); // confirmed live: undisclosed-fee label
         assert_eq!(parse_transfer_kind("€ 500K"), TransferKind::Permanent { fee: Some(dec!(0.5)) }); // confirmed live: space after symbol
+    }
+
+    #[test]
+    fn resting_value_is_anchored_on_both_sides_of_a_transfer() {
+        // Matches every other real-event handler (Goal/Card/WhistleEnd/
+        // AdminCorrection) - without this, a club that transfers a player
+        // and then goes 7+ real days quiet would get pulled by
+        // apply_stale_club_reversion back toward its stale *pre-transfer*
+        // resting_value instead of the value the transfer itself produced.
+        let (engine, seller, buyer) = engine_with_two_clubs();
+        let event = TransferEvent {
+            existing_player_id: None,
+            player_name: "Test Player".into(),
+            position_bucket: PositionBucket::Att,
+            from: Some(seller),
+            to: Some(buyer),
+            kind: TransferKind::Permanent { fee: Some(dec!(45.0)) },
+        };
+        engine.process_transfer(event, 0);
+
+        let seller_state = engine.club_states.get(&seller).unwrap();
+        let buyer_state = engine.club_states.get(&buyer).unwrap();
+        assert_eq!(seller_state.resting_value, Some(seller_state.intrinsic_value), "seller's resting_value should be anchored to its post-transfer intrinsic_value");
+        assert_eq!(buyer_state.resting_value, Some(buyer_state.intrinsic_value), "buyer's resting_value should be anchored to its post-transfer intrinsic_value");
     }
 
     #[test]
