@@ -103,7 +103,10 @@ mod tests {
         assert_eq!(ts.len(), 2);
         // Initial 100/50 = 2.0
         // After first goal (min 10): impact_pct = 0.05 + 0.10 * 10/90 = 0.0611...
-        // (percent of club1's current value, not a flat point add)
+        // (percent of each club's own current value, not a flat point add) -
+        // club1 (scorer) moves up by this, club2 (conceder) moves down by
+        // the same mirrored percentage, so the rate widens by more than
+        // club1's own move alone would produce.
         // New rate > 2.0
         assert!(ts[0].1 > dec!(2.0));
         assert!(ts[1].1 > ts[0].1);

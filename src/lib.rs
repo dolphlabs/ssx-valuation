@@ -317,39 +317,75 @@ impl ValuationEngine {
         
         match event {
             MatchEvent::Goal { team_id, opponent_id, player_id, minute } => {
-                let rivalry_multiplier = self.get_rivalry_multiplier(team_id, opponent_id);
+                let scorer_rivalry_multiplier = self.get_rivalry_multiplier(team_id, opponent_id);
+                let time_multiplier = Decimal::from(minute) / dec!(90.0);
+                // Percent of the club's *current* value, not a flat point
+                // add - a flat number meant identical events were worth
+                // wildly different relative moves depending purely on a
+                // club's absolute valuation (confirmed live: ~0.7% for a
+                // ~2,250-value club vs. ~5.6% for a ~270-value one, same
+                // goal). `value += value * pct` also can't drive a value
+                // negative the way repeated flat subtractions could.
+                let base_impact_pct = dec!(0.05) + (dec!(0.10) * time_multiplier);
+
                 if let Some(mut club) = self.club_states.get_mut(&team_id) {
-                    let time_multiplier = Decimal::from(minute) / dec!(90.0);
-                    // Percent of the club's *current* value, not a flat point
-                    // add - a flat number meant identical events were worth
-                    // wildly different relative moves depending purely on a
-                    // club's absolute valuation (confirmed live: ~0.7% for a
-                    // ~2,250-value club vs. ~5.6% for a ~270-value one, same
-                    // goal). `value += value * pct` also can't drive a value
-                    // negative the way repeated flat subtractions could.
-                    let impact_pct = (dec!(0.05) + (dec!(0.10) * time_multiplier)) * rivalry_multiplier;
+                    let impact_pct = base_impact_pct * scorer_rivalry_multiplier;
                     let base_value = club.intrinsic_value;
                     club.intrinsic_value += base_value * impact_pct;
                     club.last_match_update = current_ts;
                     club.resting_value = Some(club.intrinsic_value);
                     self.notify(EngineUpdate::Club { id: team_id, state: club.clone() });
                 }
+                // Conceding is real, negative signal too - a goal used to
+                // only ever pump the scorer and leave the conceding club
+                // completely untouched, which meant a win had unbounded
+                // upside with no symmetric downside for the loss (confirmed
+                // live: a single lopsided result pushed one club to ~2x the
+                // next-highest valuation in the entire game). Mirrors the
+                // scorer's own move exactly - same base formula, opposite
+                // sign - scaled by the *conceding* club's own rivalry factor
+                // toward the scorer, not the scorer's factor toward them,
+                // since each side's reaction is sized by how much *they*
+                // care about this fixture.
+                let conceder_rivalry_multiplier = self.get_rivalry_multiplier(opponent_id, team_id);
+                if let Some(mut opponent_club) = self.club_states.get_mut(&opponent_id) {
+                    let impact_pct = base_impact_pct * conceder_rivalry_multiplier;
+                    let base_value = opponent_club.intrinsic_value;
+                    opponent_club.intrinsic_value -= base_value * impact_pct;
+                    opponent_club.last_match_update = current_ts;
+                    opponent_club.resting_value = Some(opponent_club.intrinsic_value);
+                    self.notify(EngineUpdate::Club { id: opponent_id, state: opponent_club.clone() });
+                }
                 if let Some(mut player) = self.player_states.get_mut(&player_id) {
                     let pos_multiplier = player.position.base_weight();
-                    let player_impact_pct = dec!(0.15) * pos_multiplier * player.form_weight * rivalry_multiplier;
+                    let player_impact_pct = dec!(0.15) * pos_multiplier * player.form_weight * scorer_rivalry_multiplier;
                     let base_value = player.intrinsic_value;
                     player.intrinsic_value += base_value * player_impact_pct;
                     self.notify(EngineUpdate::Player { id: player_id, state: player.clone() });
                 }
             }
             MatchEvent::RedCard { team_id, opponent_id, player_id } => {
-                let rivalry_multiplier = self.get_rivalry_multiplier(team_id, opponent_id);
+                let carded_rivalry_multiplier = self.get_rivalry_multiplier(team_id, opponent_id);
                 if let Some(mut club) = self.club_states.get_mut(&team_id) {
                     let base_value = club.intrinsic_value;
-                    club.intrinsic_value -= base_value * dec!(0.075) * rivalry_multiplier;
+                    club.intrinsic_value -= base_value * dec!(0.075) * carded_rivalry_multiplier;
                     club.last_match_update = current_ts;
                     club.resting_value = Some(club.intrinsic_value);
                     self.notify(EngineUpdate::Club { id: team_id, state: club.clone() });
+                }
+                // A red card against the opponent is real positive signal
+                // too - down a player is a genuine disadvantage for them,
+                // which reads as good news for the other side. Mirrors the
+                // carded club's own move (same magnitude, opposite sign),
+                // scaled by the *benefiting* club's own rivalry factor
+                // toward the carded team.
+                let benefiting_rivalry_multiplier = self.get_rivalry_multiplier(opponent_id, team_id);
+                if let Some(mut opponent_club) = self.club_states.get_mut(&opponent_id) {
+                    let base_value = opponent_club.intrinsic_value;
+                    opponent_club.intrinsic_value += base_value * dec!(0.075) * benefiting_rivalry_multiplier;
+                    opponent_club.last_match_update = current_ts;
+                    opponent_club.resting_value = Some(opponent_club.intrinsic_value);
+                    self.notify(EngineUpdate::Club { id: opponent_id, state: opponent_club.clone() });
                 }
                 if let Some(mut player) = self.player_states.get_mut(&player_id) {
                     player.form_weight *= dec!(0.5);
@@ -357,13 +393,23 @@ impl ValuationEngine {
                 }
             }
             MatchEvent::YellowCard { team_id, opponent_id, player_id } => {
-                let rivalry_multiplier = self.get_rivalry_multiplier(team_id, opponent_id);
+                let carded_rivalry_multiplier = self.get_rivalry_multiplier(team_id, opponent_id);
                 if let Some(mut club) = self.club_states.get_mut(&team_id) {
                     let base_value = club.intrinsic_value;
-                    club.intrinsic_value -= base_value * dec!(0.025) * rivalry_multiplier;
+                    club.intrinsic_value -= base_value * dec!(0.025) * carded_rivalry_multiplier;
                     club.last_match_update = current_ts;
                     club.resting_value = Some(club.intrinsic_value);
                     self.notify(EngineUpdate::Club { id: team_id, state: club.clone() });
+                }
+                // Same mirrored-benefit reasoning as RedCard above, scaled
+                // to the yellow-card magnitude.
+                let benefiting_rivalry_multiplier = self.get_rivalry_multiplier(opponent_id, team_id);
+                if let Some(mut opponent_club) = self.club_states.get_mut(&opponent_id) {
+                    let base_value = opponent_club.intrinsic_value;
+                    opponent_club.intrinsic_value += base_value * dec!(0.025) * benefiting_rivalry_multiplier;
+                    opponent_club.last_match_update = current_ts;
+                    opponent_club.resting_value = Some(opponent_club.intrinsic_value);
+                    self.notify(EngineUpdate::Club { id: opponent_id, state: opponent_club.clone() });
                 }
                 if let Some(mut player) = self.player_states.get_mut(&player_id) {
                     player.form_weight *= dec!(0.9);
@@ -572,6 +618,66 @@ mod event_impact_tests {
         engine.process_event(MatchEvent::YellowCard { team_id: small_club, opponent_id: ClubId(3), player_id: small_player }, 0);
         let after = engine.club_states.get(&small_club).unwrap().intrinsic_value;
         assert_eq!(after, dec!(1000.0) * (dec!(1) - dec!(0.025)), "expected exactly a 2.5% reduction, got {after}");
+    }
+
+    #[test]
+    fn goal_also_moves_the_conceding_club_down_by_the_mirrored_percentage() {
+        // A goal used to only ever pump the scorer, leaving the conceding
+        // club untouched - which meant wins had unbounded upside with no
+        // symmetric downside for a loss (confirmed live: a single lopsided
+        // result pushed one club to ~2x the next-highest valuation in the
+        // entire game). This is the direct fix: the conceding club moves
+        // down by the same formula, opposite sign.
+        let (engine, scorer, scorer_player, conceder, _conceder_player) = engine_with_two_clubs(dec!(1000.0), dec!(1000.0));
+        engine.process_event(MatchEvent::Goal { team_id: scorer, opponent_id: conceder, player_id: scorer_player, minute: 60 }, 0);
+
+        let scorer_after = engine.club_states.get(&scorer).unwrap().intrinsic_value;
+        let conceder_after = engine.club_states.get(&conceder).unwrap().intrinsic_value;
+
+        // No rivalry configured between these two, so both sides use a 1.0x
+        // multiplier - the move should be an exact mirror image.
+        let expected_pct = dec!(0.05) + (dec!(0.10) * dec!(60.0) / dec!(90.0));
+        assert_eq!(scorer_after, dec!(1000.0) * (dec!(1) + expected_pct), "scorer should be up by exactly {expected_pct}, got {scorer_after}");
+        assert_eq!(conceder_after, dec!(1000.0) * (dec!(1) - expected_pct), "conceder should be down by exactly {expected_pct}, got {conceder_after}");
+    }
+
+    #[test]
+    fn card_also_moves_the_benefiting_opponent_up_by_the_mirrored_percentage() {
+        // Symmetric counterpart to the goal test above, for both card types
+        // - going down a player is a real disadvantage for the carded club,
+        // which should read as real (if small) good news for the opponent,
+        // not nothing.
+        let (engine, carded, carded_player, benefiting, _benefiting_player) = engine_with_two_clubs(dec!(1000.0), dec!(1000.0));
+        engine.process_event(MatchEvent::RedCard { team_id: carded, opponent_id: benefiting, player_id: carded_player }, 0);
+
+        let carded_after = engine.club_states.get(&carded).unwrap().intrinsic_value;
+        let benefiting_after = engine.club_states.get(&benefiting).unwrap().intrinsic_value;
+
+        assert_eq!(carded_after, dec!(1000.0) * (dec!(1) - dec!(0.075)), "carded club should be down 7.5%, got {carded_after}");
+        assert_eq!(benefiting_after, dec!(1000.0) * (dec!(1) + dec!(0.075)), "benefiting opponent should be up 7.5%, got {benefiting_after}");
+    }
+
+    #[test]
+    fn mirrored_impact_uses_each_sides_own_rivalry_factor_not_a_shared_one() {
+        // The scorer's own configured rivalry factor toward the opponent
+        // must not leak into the opponent's side of the move - each club's
+        // reaction is sized by *its own* configured feeling about this
+        // fixture, which real seed data isn't always symmetric about.
+        let (engine, scorer, scorer_player, conceder, _conceder_player) = engine_with_two_clubs(dec!(1000.0), dec!(1000.0));
+        {
+            let mut scorer_state = engine.club_states.get_mut(&scorer).unwrap();
+            scorer_state.set_rival_factor(conceder, dec!(2.0)); // scorer cares a lot about this fixture
+        }
+        // conceder has no configured factor toward scorer - stays at the 1.0x default.
+
+        engine.process_event(MatchEvent::Goal { team_id: scorer, opponent_id: conceder, player_id: scorer_player, minute: 60 }, 0);
+
+        let scorer_after = engine.club_states.get(&scorer).unwrap().intrinsic_value;
+        let conceder_after = engine.club_states.get(&conceder).unwrap().intrinsic_value;
+
+        let base_pct = dec!(0.05) + (dec!(0.10) * dec!(60.0) / dec!(90.0));
+        assert_eq!(scorer_after, dec!(1000.0) * (dec!(1) + base_pct * dec!(2.0)), "scorer's own 2.0x rivalry factor should apply to its own move");
+        assert_eq!(conceder_after, dec!(1000.0) * (dec!(1) - base_pct), "conceder has no configured factor, so its move should stay at the 1.0x default, not inherit the scorer's 2.0x");
     }
 }
 
