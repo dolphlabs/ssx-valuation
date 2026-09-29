@@ -182,6 +182,15 @@ pub struct ClubState {
     pub top_oppositions: BTreeMap<ClubId, Decimal>,
     pub rivals: Vec<(ClubId, Decimal)>,
     pub player_ids: Vec<PlayerId>,
+    /// Net percentage this club has already gained/lost from card events
+    /// (its own cards, and its opponent's) since the current match's
+    /// kickoff - see `apply_capped_disciplinary_delta`. Reset to zero at
+    /// `WhistleEnd`. `#[serde(default)]` for the same reason as
+    /// `resting_value` above - a Redis-persisted `ClubState` from before
+    /// this field existed deserializes to `0` (no accumulated impact yet),
+    /// not a deploy-breaking error.
+    #[serde(default)]
+    pub disciplinary_impact_this_match: Decimal,
 }
 
 impl ClubState {
@@ -194,6 +203,7 @@ impl ClubState {
             top_oppositions: BTreeMap::new(),
             rivals: Vec::new(),
             player_ids: Vec::new(),
+            disciplinary_impact_this_match: Decimal::ZERO,
         }
     }
 
@@ -326,6 +336,47 @@ impl ValuationEngine {
             club.intrinsic_value += gap * PULL_FRACTION;
             self.notify(EngineUpdate::Club { id: club.id, state: club.clone(), ts: current_ts });
         }
+    }
+
+    /// Hard ceiling on how much a single match's *disciplinary* events
+    /// (a club's own cards, and its opponent's) can move a club's value,
+    /// net, regardless of how many card events fire. Sized to roughly one
+    /// average-minute goal's impact (`base_impact_pct` at minute 45 is
+    /// 5%) - a card is a contributing signal, not the match outcome
+    /// itself, so it should never be able to structurally outweigh the
+    /// goals actually scored. Without this, per-event magnitude alone
+    /// can't close the loophole: a sufficiently card-heavy match (a red
+    /// plus several yellows isn't exotic) can still out-stack a single
+    /// goal no matter how small each individual card's own weight is -
+    /// this bounds the *cumulative* effect directly instead of trying to
+    /// pick a per-event number small enough to survive an unbounded count
+    /// of events, which no fixed per-event number can actually guarantee.
+    /// Confirmed against a real incident (see the Sep 2026 Man City vs
+    /// Man United match in `disciplinary_cap_tests` below): the club that
+    /// lost 0-1 had gained +9.75% net from the winning side's 1 red + 3
+    /// yellow cards before this cap existed - this constant is what turns
+    /// that into a net loss instead, as losing a match should produce.
+    const MAX_DISCIPLINARY_IMPACT_PCT_PER_MATCH: Decimal = dec!(0.06);
+
+    /// Applies `proposed_pct` to `club`'s running per-match disciplinary
+    /// accumulator, clamped to `[-MAX_DISCIPLINARY_IMPACT_PCT_PER_MATCH,
+    /// +MAX_DISCIPLINARY_IMPACT_PCT_PER_MATCH]`, and returns the *actual*
+    /// delta that fits within that remaining headroom - which may be less
+    /// than `proposed_pct` (or even zero) once the cap is already close,
+    /// and is always the full `proposed_pct` when it moves the
+    /// accumulator back *toward* zero (shrinking an existing swing always
+    /// has room, by construction - only growing an already-large swing
+    /// gets throttled). Callers apply the returned value to
+    /// `intrinsic_value` (never the raw `proposed_pct`) and feed the same
+    /// returned value into `apply_rivalry_spillover`, so a third-party
+    /// rival never reacts to more than what actually happened to the
+    /// mover - the cap closes the spillover loophole too, not just the
+    /// direct match effect.
+    fn apply_capped_disciplinary_delta(club: &mut ClubState, proposed_pct: Decimal) -> Decimal {
+        let current = club.disciplinary_impact_this_match;
+        let new_total = (current + proposed_pct).clamp(-Self::MAX_DISCIPLINARY_IMPACT_PCT_PER_MATCH, Self::MAX_DISCIPLINARY_IMPACT_PCT_PER_MATCH);
+        club.disciplinary_impact_this_match = new_total;
+        new_total - current
     }
 
     /// Ripples a club's own real value movement out to every OTHER club
@@ -462,25 +513,35 @@ impl ValuationEngine {
                 let carded_rivalry_multiplier = self.get_rivalry_multiplier(team_id, opponent_id);
                 let mut carded_impact_pct = Decimal::ZERO;
                 if let Some(mut club) = self.club_states.get_mut(&team_id) {
-                    carded_impact_pct = dec!(0.075) * carded_rivalry_multiplier;
+                    // Base magnitude sits below an average-minute goal
+                    // (5%) - a red card is genuinely significant but is a
+                    // contributing signal, not the match outcome itself;
+                    // see MAX_DISCIPLINARY_IMPACT_PCT_PER_MATCH for the
+                    // other half of this calibration (the per-match cap).
+                    let proposed_pct = dec!(0.04) * carded_rivalry_multiplier;
+                    carded_impact_pct = Self::apply_capped_disciplinary_delta(&mut club, -proposed_pct);
                     let base_value = club.intrinsic_value;
-                    club.intrinsic_value -= base_value * carded_impact_pct;
+                    club.intrinsic_value += base_value * carded_impact_pct;
                     club.last_match_update = current_ts;
                     club.resting_value = Some(club.intrinsic_value);
                     self.notify(EngineUpdate::Club { id: team_id, state: club.clone(), ts: current_ts });
                 }
-                self.apply_rivalry_spillover(team_id, opponent_id, -carded_impact_pct, current_ts);
+                self.apply_rivalry_spillover(team_id, opponent_id, carded_impact_pct, current_ts);
 
                 // A red card against the opponent is real positive signal
                 // too - down a player is a genuine disadvantage for them,
                 // which reads as good news for the other side. Mirrors the
                 // carded club's own move (same magnitude, opposite sign),
                 // scaled by the *benefiting* club's own rivalry factor
-                // toward the carded team.
+                // toward the carded team, and capped by the same per-match
+                // disciplinary ceiling - this is the side of the ceiling
+                // that actually mattered in the real incident this was
+                // calibrated against (see disciplinary_cap_tests).
                 let benefiting_rivalry_multiplier = self.get_rivalry_multiplier(opponent_id, team_id);
                 let mut benefiting_impact_pct = Decimal::ZERO;
                 if let Some(mut opponent_club) = self.club_states.get_mut(&opponent_id) {
-                    benefiting_impact_pct = dec!(0.075) * benefiting_rivalry_multiplier;
+                    let proposed_pct = dec!(0.04) * benefiting_rivalry_multiplier;
+                    benefiting_impact_pct = Self::apply_capped_disciplinary_delta(&mut opponent_club, proposed_pct);
                     let base_value = opponent_club.intrinsic_value;
                     opponent_club.intrinsic_value += base_value * benefiting_impact_pct;
                     opponent_club.last_match_update = current_ts;
@@ -498,21 +559,26 @@ impl ValuationEngine {
                 let carded_rivalry_multiplier = self.get_rivalry_multiplier(team_id, opponent_id);
                 let mut carded_impact_pct = Decimal::ZERO;
                 if let Some(mut club) = self.club_states.get_mut(&team_id) {
-                    carded_impact_pct = dec!(0.025) * carded_rivalry_multiplier;
+                    // Clearly below the smallest possible goal impact
+                    // (2.5% at minute 0) - a yellow card is a minor,
+                    // incidental signal on its own.
+                    let proposed_pct = dec!(0.01) * carded_rivalry_multiplier;
+                    carded_impact_pct = Self::apply_capped_disciplinary_delta(&mut club, -proposed_pct);
                     let base_value = club.intrinsic_value;
-                    club.intrinsic_value -= base_value * carded_impact_pct;
+                    club.intrinsic_value += base_value * carded_impact_pct;
                     club.last_match_update = current_ts;
                     club.resting_value = Some(club.intrinsic_value);
                     self.notify(EngineUpdate::Club { id: team_id, state: club.clone(), ts: current_ts });
                 }
-                self.apply_rivalry_spillover(team_id, opponent_id, -carded_impact_pct, current_ts);
+                self.apply_rivalry_spillover(team_id, opponent_id, carded_impact_pct, current_ts);
 
                 // Same mirrored-benefit reasoning as RedCard above, scaled
-                // to the yellow-card magnitude.
+                // to the yellow-card magnitude and capped the same way.
                 let benefiting_rivalry_multiplier = self.get_rivalry_multiplier(opponent_id, team_id);
                 let mut benefiting_impact_pct = Decimal::ZERO;
                 if let Some(mut opponent_club) = self.club_states.get_mut(&opponent_id) {
-                    benefiting_impact_pct = dec!(0.025) * benefiting_rivalry_multiplier;
+                    let proposed_pct = dec!(0.01) * benefiting_rivalry_multiplier;
+                    benefiting_impact_pct = Self::apply_capped_disciplinary_delta(&mut opponent_club, proposed_pct);
                     let base_value = opponent_club.intrinsic_value;
                     opponent_club.intrinsic_value += base_value * benefiting_impact_pct;
                     opponent_club.last_match_update = current_ts;
@@ -539,6 +605,9 @@ impl ValuationEngine {
                     if let Some(mut club) = self.club_states.get_mut(&team_id) {
                         club.last_match_update = current_ts;
                         club.resting_value = Some(club.intrinsic_value);
+                        // Fresh disciplinary headroom for the next match -
+                        // see MAX_DISCIPLINARY_IMPACT_PCT_PER_MATCH.
+                        club.disciplinary_impact_this_match = Decimal::ZERO;
                         self.notify(EngineUpdate::Club { id: team_id, state: club.clone(), ts: current_ts });
                     }
                     
@@ -731,7 +800,7 @@ mod event_impact_tests {
         let (engine, small_club, small_player, _big_club, _big_player) = engine_with_two_clubs(dec!(1000.0), dec!(1000.0));
         engine.process_event(MatchEvent::RedCard { team_id: small_club, opponent_id: ClubId(3), player_id: small_player }, 0);
         let after = engine.club_states.get(&small_club).unwrap().intrinsic_value;
-        assert_eq!(after, dec!(1000.0) * (dec!(1) - dec!(0.075)), "expected exactly a 7.5% reduction, got {after}");
+        assert_eq!(after, dec!(1000.0) * (dec!(1) - dec!(0.04)), "expected exactly a 4% reduction, got {after}");
     }
 
     #[test]
@@ -739,7 +808,7 @@ mod event_impact_tests {
         let (engine, small_club, small_player, _big_club, _big_player) = engine_with_two_clubs(dec!(1000.0), dec!(1000.0));
         engine.process_event(MatchEvent::YellowCard { team_id: small_club, opponent_id: ClubId(3), player_id: small_player }, 0);
         let after = engine.club_states.get(&small_club).unwrap().intrinsic_value;
-        assert_eq!(after, dec!(1000.0) * (dec!(1) - dec!(0.025)), "expected exactly a 2.5% reduction, got {after}");
+        assert_eq!(after, dec!(1000.0) * (dec!(1) - dec!(0.01)), "expected exactly a 1% reduction, got {after}");
     }
 
     #[test]
@@ -775,8 +844,8 @@ mod event_impact_tests {
         let carded_after = engine.club_states.get(&carded).unwrap().intrinsic_value;
         let benefiting_after = engine.club_states.get(&benefiting).unwrap().intrinsic_value;
 
-        assert_eq!(carded_after, dec!(1000.0) * (dec!(1) - dec!(0.075)), "carded club should be down 7.5%, got {carded_after}");
-        assert_eq!(benefiting_after, dec!(1000.0) * (dec!(1) + dec!(0.075)), "benefiting opponent should be up 7.5%, got {benefiting_after}");
+        assert_eq!(carded_after, dec!(1000.0) * (dec!(1) - dec!(0.04)), "carded club should be down 4%, got {carded_after}");
+        assert_eq!(benefiting_after, dec!(1000.0) * (dec!(1) + dec!(0.04)), "benefiting opponent should be up 4%, got {benefiting_after}");
     }
 
     #[test]
@@ -946,6 +1015,132 @@ mod event_impact_tests {
 
         let second_hop_after = engine.club_states.get(&second_hop).unwrap().intrinsic_value;
         assert_eq!(second_hop_after, dec!(1000.0), "a rival of the spillover-affected reactor must feel nothing - single-hop only");
+    }
+
+    #[test]
+    fn repeated_cards_in_one_match_stop_accumulating_once_the_cap_is_hit() {
+        let (engine, club, player, opponent, _opponent_player) = engine_with_two_clubs(dec!(1000.0), dec!(1000.0));
+        // No rivalry factor configured (defaults to 1.0x), so each yellow
+        // card proposes exactly -1% - six of them exactly exhausts the 6%
+        // cap with no remainder, making the boundary easy to check exactly.
+        for _ in 0..10 {
+            engine.process_event(MatchEvent::YellowCard { team_id: club, opponent_id: opponent, player_id: player }, 0);
+        }
+        let accumulated = engine.club_states.get(&club).unwrap().disciplinary_impact_this_match;
+        assert_eq!(accumulated, dec!(-0.06), "10 yellow cards should still cap at exactly -6%, not -10%");
+
+        let after = engine.club_states.get(&club).unwrap().intrinsic_value;
+        assert!(after < dec!(1000.0), "the club should still be down some");
+        assert!(after > dec!(900.0), "but nowhere near 10 uncapped 1% reductions worth (~904.4 vs the true 6-card-equivalent ~941)");
+    }
+
+    #[test]
+    fn cap_resets_at_whistle_end_giving_the_next_match_fresh_headroom() {
+        let (engine, club, player, opponent, _opponent_player) = engine_with_two_clubs(dec!(1000.0), dec!(1000.0));
+        for _ in 0..10 {
+            engine.process_event(MatchEvent::YellowCard { team_id: club, opponent_id: opponent, player_id: player }, 0);
+        }
+        assert_eq!(engine.club_states.get(&club).unwrap().disciplinary_impact_this_match, dec!(-0.06));
+
+        engine.process_event(MatchEvent::WhistleEnd { team_a_id: club, team_b_id: opponent }, 0);
+        assert_eq!(
+            engine.club_states.get(&club).unwrap().disciplinary_impact_this_match,
+            dec!(0),
+            "the accumulator must reset at full time, or a club that had a rough match would start its NEXT match already capped"
+        );
+
+        let value_before_next_card = engine.club_states.get(&club).unwrap().intrinsic_value;
+        engine.process_event(MatchEvent::YellowCard { team_id: club, opponent_id: opponent, player_id: player }, 0);
+        let value_after_next_card = engine.club_states.get(&club).unwrap().intrinsic_value;
+        assert_eq!(
+            value_after_next_card,
+            value_before_next_card * (dec!(1) - dec!(0.01)),
+            "the first card of a new match should apply at full magnitude, proving the reset actually freed up headroom"
+        );
+    }
+
+    #[test]
+    fn moving_back_toward_zero_is_never_throttled_by_the_cap() {
+        let (engine, club, player, opponent, opponent_player) = engine_with_two_clubs(dec!(1000.0), dec!(1000.0));
+        // Saturate `club`'s accumulator at the positive cap by having the
+        // opponent get carded twice (club is the benefiting side).
+        for _ in 0..2 {
+            engine.process_event(MatchEvent::RedCard { team_id: opponent, opponent_id: club, player_id: opponent_player }, 0);
+        }
+        assert_eq!(engine.club_states.get(&club).unwrap().disciplinary_impact_this_match, dec!(0.06));
+
+        // Now `club` itself gets carded - a move back toward zero - and
+        // must apply at its full proposed magnitude despite being at the
+        // opposite boundary, since shrinking an existing swing always has
+        // room by construction.
+        engine.process_event(MatchEvent::YellowCard { team_id: club, opponent_id: opponent, player_id: player }, 0);
+        let accumulated = engine.club_states.get(&club).unwrap().disciplinary_impact_this_match;
+        assert_eq!(accumulated, dec!(0.06) - dec!(0.01), "a card moving the total back toward zero must apply in full, never throttled");
+    }
+
+    #[test]
+    fn spillover_reflects_the_capped_delta_not_the_proposed_one() {
+        let (engine, club, player, opponent, _opponent_player) = engine_with_two_clubs(dec!(1000.0), dec!(1000.0));
+        let reactor = ClubId(99);
+        let mut reactor_state = ClubState::new(reactor);
+        reactor_state.intrinsic_value = dec!(1000.0);
+        reactor_state.set_rival_factor(club, dec!(1.0));
+        engine.club_states.insert(reactor, reactor_state);
+
+        // Saturate `club`'s negative cap first (6 yellow cards, -1% each).
+        for _ in 0..6 {
+            engine.process_event(MatchEvent::YellowCard { team_id: club, opponent_id: opponent, player_id: player }, 0);
+        }
+        let reactor_after_saturating = engine.club_states.get(&reactor).unwrap().intrinsic_value;
+
+        // A 7th card proposes another -1% for `club`, but the cap means the
+        // ACTUAL delta is zero - spillover must reflect that zero, not the
+        // proposed -1%, or a third party would react to a move that never
+        // actually happened to the mover.
+        engine.process_event(MatchEvent::YellowCard { team_id: club, opponent_id: opponent, player_id: player }, 0);
+        let reactor_after_seventh_card = engine.club_states.get(&reactor).unwrap().intrinsic_value;
+
+        assert_eq!(
+            reactor_after_seventh_card, reactor_after_saturating,
+            "once the mover's own delta is capped to zero, a rival reactor must see zero spillover too, not spillover on the pre-cap proposal"
+        );
+    }
+
+    /// Reproduces the real Sep 2026 Man City (rivalry 1.5x each way) vs Man
+    /// United match that motivated this whole cap: City picked up 1 red
+    /// card + 3 yellow cards, scored 1 goal, United picked up 1 yellow of
+    /// their own - a match United lost 0-1. Before this cap existed,
+    /// United's net move from this match was +9.75% (a losing side gaining
+    /// value). This pins the corrected behavior: the loss must now cost
+    /// United value overall, not hand them a net gain.
+    #[test]
+    fn the_losing_side_of_a_card_heavy_match_now_nets_a_loss_not_a_gain() {
+        let (engine, city, city_player, united, united_player) = engine_with_two_clubs(dec!(1000.0), dec!(1000.0));
+        {
+            let mut city_state = engine.club_states.get_mut(&city).unwrap();
+            city_state.set_rival_factor(united, dec!(1.5));
+        }
+        {
+            let mut united_state = engine.club_states.get_mut(&united).unwrap();
+            united_state.set_rival_factor(city, dec!(1.5));
+        }
+
+        engine.process_event(MatchEvent::RedCard { team_id: city, opponent_id: united, player_id: city_player }, 0);
+        engine.process_event(MatchEvent::YellowCard { team_id: city, opponent_id: united, player_id: city_player }, 0);
+        engine.process_event(MatchEvent::Goal { team_id: city, opponent_id: united, player_id: city_player, minute: 63 }, 0);
+        engine.process_event(MatchEvent::YellowCard { team_id: city, opponent_id: united, player_id: city_player }, 0);
+        engine.process_event(MatchEvent::YellowCard { team_id: city, opponent_id: united, player_id: city_player }, 0);
+        engine.process_event(MatchEvent::YellowCard { team_id: united, opponent_id: city, player_id: united_player }, 0);
+
+        let united_after = engine.club_states.get(&united).unwrap().intrinsic_value;
+        assert!(
+            united_after < dec!(1000.0),
+            "United lost this match 0-1 - they must end up down overall, not up, no matter how many cards City picked up. Got {united_after}"
+        );
+        assert!(
+            united_after < dec!(970.0),
+            "expected a real, substantial net loss (~950, not a rounding-distance graze under 1000) - got {united_after}"
+        );
     }
 }
 

@@ -81,6 +81,7 @@ mod tests {
             top_oppositions: BTreeMap::new(),
             rivals: vec![],
             player_ids: vec![],
+            disciplinary_impact_this_match: dec!(0.0),
         });
         engine.club_states.insert(club2, ClubState {
             id: club2,
@@ -90,6 +91,7 @@ mod tests {
             top_oppositions: BTreeMap::new(),
             rivals: vec![],
             player_ids: vec![],
+            disciplinary_impact_this_match: dec!(0.0),
         });
 
         let events = vec![
