@@ -8,7 +8,7 @@ pub mod ligue_1;
 pub mod generator;
 pub mod roster;
 
-pub use roster::{ClubMeta, ROSTER};
+pub use roster::{derby_name, ClubMeta, DERBIES, ROSTER};
 
 pub fn seed_big_five_leagues(engine: &mut ValuationEngine) {
     pl::seed(engine);

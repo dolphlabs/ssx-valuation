@@ -51,6 +51,32 @@ pub fn is_liquidatable(
     }
 }
 
+/// The pair price (quote-per-base, same units as `entry_price`) at which
+/// `is_liquidatable` would flip true, holding the quote leg's value fixed at
+/// `quote_intrinsic_now`. Solved from `margin + size·Q·(p − entry) =
+/// mmr·|size|·p·Q`, so it's the same maths the liquidation job runs, just
+/// rearranged for `p` - a display number, never a trigger. PnL here depends
+/// on both legs independently, so this is the single-leg view every exchange
+/// shows before a fill; the real check stays `is_liquidatable`.
+pub fn liquidation_price(
+    size_signed: Decimal,
+    entry_price: Decimal,
+    margin_usd: Decimal,
+    quote_intrinsic_now: Decimal,
+    maintenance_margin_ratio: Decimal,
+) -> Option<Decimal> {
+    if size_signed.is_zero() || quote_intrinsic_now.is_zero() {
+        return None;
+    }
+    let cushion = margin_usd / (size_signed.abs() * quote_intrinsic_now);
+    let price = if size_signed > Decimal::ZERO {
+        (entry_price - cushion) / (Decimal::ONE - maintenance_margin_ratio)
+    } else {
+        (entry_price + cushion) / (Decimal::ONE + maintenance_margin_ratio)
+    };
+    Some(price.max(Decimal::ZERO))
+}
+
 /// Whether a take-profit at `tp_price` (an index price, quote-per-base, same
 /// units as `entry_price`) should fire right now. For a long, TP is above
 /// entry and fires once the index price rises to meet or exceed it; for a
@@ -264,5 +290,27 @@ mod tests {
     #[test]
     fn funding_payment_zero_for_zero_size() {
         assert_eq!(funding_payment_usd(dec!(0), dec!(20000), dec!(0.001)), dec!(0));
+    }
+
+    /// At the returned price the position sits exactly on the maintenance
+    /// boundary `is_liquidatable` checks - for both directions.
+    #[test]
+    fn liquidation_price_lands_on_the_maintenance_boundary() {
+        let mmr = dec!(0.005);
+        let quote = dec!(100);
+        for (size, entry, margin) in [(dec!(10), dec!(0.8), dec!(160)), (dec!(-10), dec!(0.8), dec!(160))] {
+            let liq = liquidation_price(size, entry, margin, quote, mmr).unwrap();
+            let base_now = liq * quote;
+            let pnl = unrealized_pnl_usd(size, entry, base_now, quote);
+            let ratio = margin_ratio(margin + pnl, notional_usd_now(size, base_now)).unwrap();
+            assert!((ratio - mmr).abs() < dec!(0.0000001), "size {size}: ratio {ratio} at liq {liq}");
+        }
+    }
+
+    #[test]
+    fn long_liquidates_below_entry_and_short_above() {
+        let long = liquidation_price(dec!(10), dec!(0.8), dec!(160), dec!(100), dec!(0.005)).unwrap();
+        let short = liquidation_price(dec!(-10), dec!(0.8), dec!(160), dec!(100), dec!(0.005)).unwrap();
+        assert!(long < dec!(0.8) && short > dec!(0.8));
     }
 }
