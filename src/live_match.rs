@@ -38,6 +38,14 @@ pub enum LiveMatchFact {
     /// A `Goal` VAR took back - carries the original goal's fields so the
     /// engine can undo exactly what that goal moved.
     GoalCancelled { team_id: ClubId, opponent_id: ClubId, player_name: Option<String>, minute: u32 },
+    /// A `RedCard` VAR overturned - same fields as the card it undoes.
+    RedCardCancelled {
+        team_id: ClubId,
+        opponent_id: ClubId,
+        player_name: Option<String>,
+        #[serde(default)]
+        minute: Option<u32>,
+    },
 }
 
 impl LiveMatchFact {
@@ -80,6 +88,11 @@ impl LiveMatchFact {
                 player_id: resolve_name(*team_id, player_name),
                 minute: *minute,
             },
+            LiveMatchFact::RedCardCancelled { team_id, opponent_id, player_name, .. } => MatchEvent::RedCardCancelled {
+                team_id: *team_id,
+                opponent_id: *opponent_id,
+                player_id: resolve_name(*team_id, player_name),
+            },
         }
     }
 }
@@ -92,7 +105,7 @@ impl LiveMatchFact {
 /// just after it straight out of `valuations`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AppliedMatchEvent {
-    /// "goal", "yellow", "red", "full_time" or "goal_cancelled".
+    /// "goal", "yellow", "red", "full_time", "goal_cancelled" or "red_cancelled".
     pub kind: String,
     /// The scoring/carded club; for "full_time", the first listed side.
     pub club_id: ClubId,
@@ -151,6 +164,7 @@ impl LiveMatchFact {
             LiveMatchFact::RedCard { team_id, opponent_id, minute, .. } => ("red", *team_id, *opponent_id, *minute),
             LiveMatchFact::WhistleEnd { team_a_id, team_b_id } => ("full_time", *team_a_id, *team_b_id, None),
             LiveMatchFact::GoalCancelled { team_id, opponent_id, minute, .. } => ("goal_cancelled", *team_id, *opponent_id, Some(*minute)),
+            LiveMatchFact::RedCardCancelled { team_id, opponent_id, minute, .. } => ("red_cancelled", *team_id, *opponent_id, *minute),
         };
         AppliedMatchEvent { kind: kind.to_string(), club_id, opponent_id, minute, ts }
     }

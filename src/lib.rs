@@ -121,6 +121,11 @@ pub enum MatchEvent {
     /// VAR took back a goal already applied: the same fields as the `Goal`
     /// it undoes, so the reversal can recompute exactly what it moved.
     GoalCancelled { team_id: ClubId, opponent_id: ClubId, player_id: PlayerId, minute: u32 },
+    /// VAR overturned a red card already applied. Unlike a goal, a card's
+    /// move depends on the disciplinary headroom left when it landed, so it
+    /// can't be recomputed - it's undone from the carded club's own record
+    /// of what that card actually applied (`ClubState::red_cards_this_match`).
+    RedCardCancelled { team_id: ClubId, opponent_id: ClubId, player_id: PlayerId },
 }
 
 /// `value * (1 + pct)`, or its exact inverse - the one place a goal's moves
@@ -200,6 +205,21 @@ pub struct ClubState {
     /// not a deploy-breaking error.
     #[serde(default)]
     pub disciplinary_impact_this_match: Decimal,
+    /// Red cards this club received this match and exactly what each moved,
+    /// so VAR can take one back (`RedCardCancelled`). Cleared at
+    /// `WhistleEnd`; `default` for Redis-persisted states that predate it.
+    #[serde(default)]
+    pub red_cards_this_match: Vec<AppliedRedCard>,
+}
+
+/// One applied red card, as `RedCardCancelled` needs it: the signed,
+/// post-cap percentages actually applied to each side.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AppliedRedCard {
+    pub opponent_id: ClubId,
+    pub player_id: PlayerId,
+    pub carded_pct: Decimal,
+    pub benefiting_pct: Decimal,
 }
 
 impl ClubState {
@@ -213,6 +233,7 @@ impl ClubState {
             rivals: Vec::new(),
             player_ids: Vec::new(),
             disciplinary_impact_this_match: Decimal::ZERO,
+            red_cards_this_match: Vec::new(),
         }
     }
 
@@ -551,6 +572,41 @@ impl ValuationEngine {
         }
     }
 
+    /// Takes back the latest matching red card (same opponent, and the same
+    /// player where it resolved). Both clubs' values and the spillover are
+    /// divided back out by exactly what the card applied, and both clubs get
+    /// that disciplinary headroom back. A card with no record (already
+    /// past full time, or never applied) is a no-op.
+    fn cancel_red_card(&self, team_id: ClubId, opponent_id: ClubId, player_id: PlayerId, current_ts: u64) {
+        let Some(card) = self.club_states.get_mut(&team_id).and_then(|mut club| {
+            let cards = &club.red_cards_this_match;
+            let at = cards
+                .iter()
+                .rposition(|c| c.opponent_id == opponent_id && c.player_id == player_id)
+                .or_else(|| cards.iter().rposition(|c| c.opponent_id == opponent_id))?;
+            Some(club.red_cards_this_match.remove(at))
+        }) else {
+            return;
+        };
+
+        for (club_id, pct) in [(team_id, card.carded_pct), (opponent_id, card.benefiting_pct)] {
+            if let Some(mut club) = self.club_states.get_mut(&club_id) {
+                club.intrinsic_value = scale(club.intrinsic_value, pct, true);
+                club.disciplinary_impact_this_match -= pct;
+                club.last_match_update = current_ts;
+                club.resting_value = Some(club.intrinsic_value);
+                self.notify(EngineUpdate::Club { id: club_id, state: club.clone(), ts: current_ts });
+            }
+        }
+        self.rivalry_spillover(team_id, opponent_id, card.carded_pct, current_ts, true);
+        self.rivalry_spillover(opponent_id, team_id, card.benefiting_pct, current_ts, true);
+
+        if let Some(mut player) = self.player_states.get_mut(&player_id) {
+            player.form_weight *= dec!(2);
+            self.notify(EngineUpdate::Player { id: player_id, state: player.clone() });
+        }
+    }
+
     pub fn process_event(&self, event: MatchEvent, current_ts: u64) {
         self.notify(EngineUpdate::Event { event: event.clone(), ts: current_ts });
         
@@ -602,10 +658,22 @@ impl ValuationEngine {
                 }
                 self.apply_rivalry_spillover(opponent_id, team_id, benefiting_impact_pct, current_ts);
 
+                if let Some(mut club) = self.club_states.get_mut(&team_id) {
+                    club.red_cards_this_match.push(AppliedRedCard {
+                        opponent_id,
+                        player_id,
+                        carded_pct: carded_impact_pct,
+                        benefiting_pct: benefiting_impact_pct,
+                    });
+                }
+
                 if let Some(mut player) = self.player_states.get_mut(&player_id) {
                     player.form_weight *= dec!(0.5);
                     self.notify(EngineUpdate::Player { id: player_id, state: player.clone() });
                 }
+            }
+            MatchEvent::RedCardCancelled { team_id, opponent_id, player_id } => {
+                self.cancel_red_card(team_id, opponent_id, player_id, current_ts);
             }
             MatchEvent::YellowCard { team_id, opponent_id, player_id } => {
                 let carded_rivalry_multiplier = self.get_rivalry_multiplier(team_id, opponent_id);
@@ -660,6 +728,7 @@ impl ValuationEngine {
                         // Fresh disciplinary headroom for the next match -
                         // see MAX_DISCIPLINARY_IMPACT_PCT_PER_MATCH.
                         club.disciplinary_impact_this_match = Decimal::ZERO;
+                        club.red_cards_this_match.clear();
                         self.notify(EngineUpdate::Club { id: team_id, state: club.clone(), ts: current_ts });
                     }
                     
@@ -757,7 +826,7 @@ impl ValuationEngine {
 }
 
 #[cfg(test)]
-mod goal_cancelled_tests {
+mod var_reversal_tests {
     use super::*;
 
     /// Scorer, conceder (rivals both ways, so the rivalry multipliers aren't
@@ -809,6 +878,59 @@ mod goal_cancelled_tests {
         let nudge_only = engine();
         nudge_only.process_event(MatchEvent::AdminCorrection { team_id: ClubId(1), delta_pct: dec!(10) }, 1);
         assert!(close(&values(&with_var), &values(&nudge_only)));
+    }
+
+    fn red(team: u32, opp: u32) -> MatchEvent {
+        MatchEvent::RedCard { team_id: ClubId(team), opponent_id: ClubId(opp), player_id: PlayerId(0) }
+    }
+    fn red_cancelled(team: u32, opp: u32) -> MatchEvent {
+        MatchEvent::RedCardCancelled { team_id: ClubId(team), opponent_id: ClubId(opp), player_id: PlayerId(0) }
+    }
+    fn headroom(engine: &ValuationEngine, id: u32) -> Decimal {
+        engine.club_states.get(&ClubId(id)).unwrap().disciplinary_impact_this_match
+    }
+
+    #[test]
+    fn an_overturned_red_card_restores_values_and_disciplinary_headroom() {
+        let engine = engine();
+        let before = values(&engine);
+        engine.process_event(red(2, 1), 0);
+        assert!(!close(&values(&engine), &before), "the card should have moved prices");
+        engine.process_event(red_cancelled(2, 1), 1);
+        assert!(close(&values(&engine), &before));
+        assert_eq!(headroom(&engine, 1), Decimal::ZERO);
+        assert_eq!(headroom(&engine, 2), Decimal::ZERO);
+        assert!(engine.club_states.get(&ClubId(2)).unwrap().red_cards_this_match.is_empty());
+    }
+
+    #[test]
+    fn a_capped_second_card_is_undone_by_what_it_actually_applied() {
+        // The second red runs into the per-match cap, so it applies less
+        // than the full 4% x rivalry. Overturning it must take out only what
+        // it moved - recomputing it fresh would overshoot.
+        let engine = engine();
+        engine.process_event(red(2, 1), 0);
+        let after_one = values(&engine);
+        let headroom_after_one = (headroom(&engine, 1), headroom(&engine, 2));
+        engine.process_event(red(2, 1), 1);
+        let second = engine.club_states.get(&ClubId(2)).unwrap().red_cards_this_match[1].clone();
+        assert!(second.carded_pct.abs() > Decimal::ZERO && second.carded_pct.abs() < dec!(0.04) * dec!(1.3), "second card should be capped: {second:?}");
+        engine.process_event(red_cancelled(2, 1), 2);
+        assert!(close(&values(&engine), &after_one));
+        assert_eq!((headroom(&engine, 1), headroom(&engine, 2)), headroom_after_one);
+    }
+
+    #[test]
+    fn an_unknown_red_card_cancel_changes_nothing() {
+        let engine = engine();
+        engine.process_event(red(2, 1), 0);
+        let after = values(&engine);
+        engine.process_event(red_cancelled(1, 2), 1); // club 1 was never carded
+        assert_eq!(values(&engine), after);
+        engine.process_event(MatchEvent::WhistleEnd { team_a_id: ClubId(1), team_b_id: ClubId(2) }, 2);
+        let after_ft = values(&engine);
+        engine.process_event(red_cancelled(2, 1), 3); // full time cleared the record
+        assert_eq!(values(&engine), after_ft);
     }
 }
 
