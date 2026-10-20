@@ -83,6 +83,22 @@ fn heartbeat_multiplier(shock: f64) -> Decimal {
 /// second hand-picked number - if the interval ever changes, the realized
 /// volatility stays correctly calibrated to `target_monthly_std` rather
 /// than silently drifting.
+/// Ceiling on `HEARTBEAT_MONTHLY_VOLATILITY` - a guard against a typo like
+/// `10`, not a product limit. 1.0 is a deliberate choice for lively charts
+/// (2026-10-19), knowing its cost: ~48% of pure noise a week against ~5% a
+/// goal, so over weeks prices drift away from results and need admin
+/// corrections. Anything below 0.2 keeps results in charge.
+pub const MAX_HEARTBEAT_MONTHLY_VOLATILITY: f64 = 1.0;
+
+/// The target the heartbeat actually runs at: `requested`, held to
+/// `0..=MAX_HEARTBEAT_MONTHLY_VOLATILITY` (a non-number means no noise).
+pub fn bounded_heartbeat_volatility(requested: f64) -> f64 {
+    if requested.is_nan() {
+        return 0.0;
+    }
+    requested.clamp(0.0, MAX_HEARTBEAT_MONTHLY_VOLATILITY)
+}
+
 pub fn heartbeat_tick_half_width(target_monthly_std: f64, heartbeat_interval_secs: f64) -> f64 {
     const SECONDS_PER_MONTH: f64 = 30.0 * 24.0 * 3600.0;
     let ticks_per_month = SECONDS_PER_MONTH / heartbeat_interval_secs;
@@ -1494,6 +1510,15 @@ mod heartbeat_drift_tests {
 #[cfg(test)]
 mod heartbeat_calibration_tests {
     use super::*;
+
+    #[test]
+    fn the_target_is_held_to_its_ceiling() {
+        assert_eq!(bounded_heartbeat_volatility(0.10), 0.10);
+        assert_eq!(bounded_heartbeat_volatility(1.0), 1.0);
+        assert_eq!(bounded_heartbeat_volatility(10.0), MAX_HEARTBEAT_MONTHLY_VOLATILITY, "a typo is held to the ceiling");
+        assert_eq!(bounded_heartbeat_volatility(-0.5), 0.0);
+        assert_eq!(bounded_heartbeat_volatility(f64::NAN), 0.0);
+    }
 
     /// Round-trips the derivation: given the half-width `a` this function
     /// returns for a target, compounding N ticks' worth of that magnitude's
