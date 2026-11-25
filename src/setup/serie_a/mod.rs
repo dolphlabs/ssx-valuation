@@ -20,6 +20,8 @@ pub mod empoli;
 pub mod parma;
 pub mod como;
 pub mod venezia;
+pub mod sassuolo;
+pub mod frosinone;
 
 pub fn seed(engine: &mut ValuationEngine) {
     inter_milan::seed(engine);
@@ -42,4 +44,6 @@ pub fn seed(engine: &mut ValuationEngine) {
     parma::seed(engine);
     como::seed(engine);
     venezia::seed(engine);
+    sassuolo::seed(engine);
+    frosinone::seed(engine);
 }

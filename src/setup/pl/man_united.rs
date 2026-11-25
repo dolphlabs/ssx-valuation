@@ -13,6 +13,7 @@ pub fn seed(engine: &mut ValuationEngine) {
     club.set_rival_factor(ClubId(5), dec!(1.6));
     club.set_rival_factor(ClubId(4), dec!(1.3));
 
+    club.set_rival_factor(ClubId(21), dec!(1.3)); // Leeds United (Roses rivalry)
     engine.club_states.insert(club_id, club);
 
     // Players

@@ -7,7 +7,7 @@
 //! only thing that resolves and mutates engine state.
 //!
 //! Exists for exactly one reason so far: the Heartbeat drift/magnitude bugs
-//! (see `heartbeat_tick_half_width`'s doc comment and AGENTS.md's "Known
+//! (see `HeartbeatNoise`'s doc comment and AGENTS.md's "Known
 //! gotchas") pushed real clubs' values down on pure noise, unrelated to
 //! actual results. This is the audited, engine-native way to correct that -
 //! not a direct Redis edit (which would bypass `ssx-node`'s own mutation
@@ -31,4 +31,9 @@ pub struct AdminCorrectionFact {
     /// is even published, so this field is for operational visibility here,
     /// not the durable audit record.
     pub note: String,
+    /// Spread the correction over this many minutes of heartbeats instead
+    /// of one jump, with trading on the club paused until it's done. `None`
+    /// (and every fact published before this field existed) lands at once.
+    #[serde(default)]
+    pub glide_minutes: Option<u32>,
 }

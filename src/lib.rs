@@ -57,52 +57,77 @@ fn heartbeat_multiplier(shock: f64) -> Decimal {
     Decimal::from_f64_retain(shock.exp()).unwrap_or(dec!(1.0))
 }
 
-/// Converts a target standalone monthly (30-day) volatility for the
-/// `Heartbeat` random walk into the per-tick uniform half-width the caller
-/// should draw `MatchEvent::Heartbeat`'s shock from. This is what keeps the
-/// walk's *magnitude* deliberately calibrated instead of an arbitrarily
-/// chosen per-tick constant - the exact mistake that let the (now-fixed)
-/// drift bug produce swings of ±50%+ a month on real production data,
-/// unrelated to any club's actual performance (see AGENTS.md's "Known
-/// gotchas"). "Standalone" matters: this is the volatility the walk would
-/// produce with *zero* real match events mixed in - real events (goals,
-/// cards, results) are expected to still dominate a club's actual month,
-/// this just bounds how much of that month is pure noise.
-///
-/// Derivation: `Uniform(-a,a)` has variance `a²/3`, so one tick's std is
-/// `a/sqrt(3)`. Because `heartbeat_multiplier` applies each shock on the
-/// log scale (`exp(shock)`, driftless), and per-tick shocks are small
-/// enough that summing them approximates the compounded log-return well,
-/// `N` independent ticks have variance `N * a²/3`. Solving for `a` given a
-/// target monthly variance:
-/// ```text
-/// target_monthly_std² = N_ticks_per_month * a² / 3
-/// a = target_monthly_std * sqrt(3 / N_ticks_per_month)
-/// ```
-/// `N_ticks_per_month` is derived from the real heartbeat interval, not a
-/// second hand-picked number - if the interval ever changes, the realized
-/// volatility stays correctly calibrated to `target_monthly_std` rather
-/// than silently drifting.
-/// Ceiling on `HEARTBEAT_MONTHLY_VOLATILITY` - a guard against a typo like
-/// `10`, not a product limit. 1.0 is a deliberate choice for lively charts
-/// (2026-10-19), knowing its cost: ~48% of pure noise a week against ~5% a
-/// goal, so over weeks prices drift away from results and need admin
-/// corrections. Anything below 0.2 keeps results in charge.
-pub const MAX_HEARTBEAT_MONTHLY_VOLATILITY: f64 = 1.0;
+/// Ceiling on `HEARTBEAT_NOISE_BAND` - a typo guard (`3` for `0.03`), not a
+/// product limit.
+pub const MAX_HEARTBEAT_NOISE_BAND: f64 = 0.25;
 
-/// The target the heartbeat actually runs at: `requested`, held to
-/// `0..=MAX_HEARTBEAT_MONTHLY_VOLATILITY` (a non-number means no noise).
-pub fn bounded_heartbeat_volatility(requested: f64) -> f64 {
-    if requested.is_nan() {
-        return 0.0;
-    }
-    requested.clamp(0.0, MAX_HEARTBEAT_MONTHLY_VOLATILITY)
+/// The heartbeat's noise: a deviation around what results say a club is
+/// worth that keeps decaying back to zero (an Ornstein-Uhlenbeck process),
+/// never a random walk. The walk this replaced compounded without limit:
+/// at the 1.0-2.0/month settings production ran from Sep to Nov 2026, noise
+/// accounted for ~96% of how clubs moved against each other, the spread
+/// between the top and bottom club went from 8x to over 5,000x, and a club
+/// could lose 73% over an international break without playing. Here the
+/// price stays within a band of its fundamental however long a club goes
+/// without a match, while still moving tick to tick.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct HeartbeatNoise {
+    /// Share of the current deviation each tick keeps: `0.5^(interval / half_life)`.
+    pub keep: f64,
+    /// Half-width of the uniform shock added on each tick.
+    pub shock_half_width: f64,
 }
 
-pub fn heartbeat_tick_half_width(target_monthly_std: f64, heartbeat_interval_secs: f64) -> f64 {
-    const SECONDS_PER_MONTH: f64 = 30.0 * 24.0 * 3600.0;
-    let ticks_per_month = SECONDS_PER_MONTH / heartbeat_interval_secs;
-    target_monthly_std * (3.0 / ticks_per_month).sqrt()
+impl HeartbeatNoise {
+    /// `band` is the long-run std of `ln(price / fundamental)`; `half_life_secs`
+    /// is how long a deviation takes to halve with no new shocks. A zero band
+    /// still decays any deviation already there, so turning the noise off
+    /// fades it out instead of freezing it into the price.
+    ///
+    /// Exact discretisation: `x' = keep * x + e` settles at variance
+    /// `Var(e) / (1 - keep^2)`, and `Uniform(-w, w)` has variance `w^2 / 3`, so
+    /// `w = band * sqrt(3 * (1 - keep^2))`.
+    pub fn calibrate(band: f64, half_life_secs: f64, interval_secs: f64) -> Self {
+        let band = if band.is_nan() { 0.0 } else { band.clamp(0.0, MAX_HEARTBEAT_NOISE_BAND) };
+        let keep = if half_life_secs > 0.0 && interval_secs > 0.0 {
+            0.5f64.powf(interval_secs / half_life_secs)
+        } else {
+            0.0
+        };
+        Self { keep, shock_half_width: band * (3.0 * (1.0 - keep * keep)).sqrt() }
+    }
+
+    /// The next deviation, from the current one and a uniform draw in `[-1, 1)`.
+    pub fn step(&self, deviation: f64, unit_draw: f64) -> f64 {
+        deviation * self.keep + unit_draw * self.shock_half_width
+    }
+}
+
+/// Old results fade: a club's fundamental drifts back toward its anchor
+/// (last season's value) so its distance halves every `half_life` with no
+/// new events. Without it a club's value was a running total of every goal
+/// it ever scored and conceded - the 2026/27 replay put Barcelona at 5.8x
+/// its seed after 17 matches and the top/bottom spread at 99x, still
+/// widening. With a 60-day half-life the same results level off at ~48x.
+/// Every goal is worth the same to every club at the same age, so unlike a
+/// cap that shrinks a leader's gains, the order clubs got there in doesn't
+/// matter - only when.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ResultFade {
+    /// Share of the log distance from the anchor each tick keeps.
+    pub keep: f64,
+}
+
+impl ResultFade {
+    pub const NONE: Self = Self { keep: 1.0 };
+
+    pub fn calibrate(half_life_secs: f64, interval_secs: f64) -> Self {
+        if half_life_secs > 0.0 && interval_secs > 0.0 {
+            Self { keep: 0.5f64.powf(interval_secs / half_life_secs) }
+        } else {
+            Self::NONE
+        }
+    }
 }
 
 // --- ID Newtypes ---
@@ -123,11 +148,13 @@ pub enum MatchEvent {
     RedCard { team_id: ClubId, opponent_id: ClubId, player_id: PlayerId },
     Injury { player_id: PlayerId, severity: u32 },
     WhistleEnd { team_a_id: ClubId, team_b_id: ClubId },
-    /// `tick_std_pct` is the uniform half-width the shock is drawn from -
-    /// caller-supplied (see `heartbeat_tick_half_width`), not hardcoded
-    /// here, so the walk's magnitude is a calibrated, product-level
-    /// decision rather than an opaque constant nobody can reason about.
-    Heartbeat { team_id: ClubId, tick_std_pct: f64 },
+    /// One tick of the club's mean-reverting noise - see `HeartbeatNoise`.
+    /// Also takes the next step of a repricing in progress.
+    Heartbeat { team_id: ClubId, noise: HeartbeatNoise, fade: ResultFade },
+    /// An audited correction spread over `ticks` heartbeats instead of
+    /// landing as one jump: moves the fundamental by `ln_delta` in total,
+    /// in equal log steps (see `ClubState::repricing_ticks_remaining`).
+    Repricing { team_id: ClubId, ln_delta: f64, ticks: u32 },
     /// A one-time, audited admin correction to `intrinsic_value` - see
     /// `admin_correction::AdminCorrectionFact` for why this exists and the
     /// isolation principle it preserves. `delta_pct` is applied
@@ -201,9 +228,9 @@ pub struct ClubState {
     pub id: ClubId,
     pub intrinsic_value: Decimal,
     pub last_match_update: u64,
-    /// The value as of the last *real* event (Goal/Card/WhistleEnd) that
-    /// touched this club - the anchor `apply_stale_club_reversion` pulls a
-    /// long-quiet club's `intrinsic_value` back toward. `Option` (not a bare
+    /// The fundamental as of the last *real* event that touched this club -
+    /// a record only since `ResultFade` replaced the 7-day reversion that
+    /// used to pull quiet clubs back toward it. `Option` (not a bare
     /// `Decimal` defaulting to zero) so that a Redis-persisted `ClubState`
     /// from before this field existed deserializes safely (`#[serde(default)]`
     /// gives `None`) instead of silently anchoring toward zero.
@@ -226,6 +253,23 @@ pub struct ClubState {
     /// `WhistleEnd`; `default` for Redis-persisted states that predate it.
     #[serde(default)]
     pub red_cards_this_match: Vec<AppliedRedCard>,
+    /// `ln(intrinsic_value / fundamental)`: how far the heartbeat has the
+    /// price from what events made of the club. Every other move scales
+    /// `intrinsic_value` multiplicatively, so dividing this back out always
+    /// leaves the fundamental exactly.
+    #[serde(default)]
+    pub noise_log: f64,
+    /// What's left of a `Repricing`: the log move still to apply and the
+    /// heartbeats left to apply it over. While ticks remain, trading on the
+    /// club is paused - the rest of the move is known in advance.
+    #[serde(default)]
+    pub repricing_ln_remaining: f64,
+    /// What old results fade back toward (`ResultFade`): the club's value at
+    /// the end of last season, i.e. its seed. `None` means no fading.
+    #[serde(default)]
+    pub anchor_value: Option<Decimal>,
+    #[serde(default)]
+    pub repricing_ticks_remaining: u32,
 }
 
 /// One applied red card, as `RedCardCancelled` needs it: the signed,
@@ -250,7 +294,51 @@ impl ClubState {
             player_ids: Vec::new(),
             disciplinary_impact_this_match: Decimal::ZERO,
             red_cards_this_match: Vec::new(),
+            noise_log: 0.0,
+            repricing_ln_remaining: 0.0,
+            repricing_ticks_remaining: 0,
+            anchor_value: None,
         }
+    }
+
+    pub fn is_repricing(&self) -> bool {
+        self.repricing_ticks_remaining > 0
+    }
+
+    /// Moves the fundamental `1 - keep` of its log distance back toward the
+    /// anchor; the noise on top is left as it is.
+    pub fn apply_fade(&mut self, fade: ResultFade) {
+        use rust_decimal::prelude::ToPrimitive;
+        let Some(anchor) = self.anchor_value.filter(|a| *a > Decimal::ZERO) else { return };
+        if fade.keep >= 1.0 {
+            return;
+        }
+        let Some(ratio) = (self.fundamental_value() / anchor).to_f64().filter(|r| *r > 0.0) else { return };
+        let offset = ratio.ln();
+        let factor = heartbeat_multiplier(offset * (fade.keep - 1.0));
+        self.intrinsic_value *= factor;
+    }
+
+    fn step_repricing(&mut self) {
+        if self.repricing_ticks_remaining == 0 {
+            return;
+        }
+        let step = self.repricing_ln_remaining / f64::from(self.repricing_ticks_remaining);
+        let factor = heartbeat_multiplier(step);
+        self.intrinsic_value *= factor;
+        self.repricing_ticks_remaining -= 1;
+        self.repricing_ln_remaining = if self.repricing_ticks_remaining == 0 { 0.0 } else { self.repricing_ln_remaining - step };
+        self.anchor_resting_value();
+    }
+
+    /// What events alone make the club worth, with the heartbeat's noise taken out.
+    pub fn fundamental_value(&self) -> Decimal {
+        self.intrinsic_value / heartbeat_multiplier(self.noise_log)
+    }
+
+    /// Records the fundamental, not the noisy price, as of this event.
+    pub(crate) fn anchor_resting_value(&mut self) {
+        self.resting_value = Some(self.fundamental_value());
     }
 
     pub fn set_rival_factor(&mut self, opponent_id: ClubId, factor: Decimal) {
@@ -361,53 +449,11 @@ impl ValuationEngine {
         self.is_transfer_window.store(is_window, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Gently pulls a long-quiet club's `intrinsic_value` back toward
-    /// `resting_value` (its value as of the last *real* event) rather than
-    /// leaving it to whatever the heartbeat's random walk has drifted it to.
-    /// Deliberately a *reversion*, not a one-directional decay: the original
-    /// version of this always multiplied the value down, which - once a club
-    /// goes quiet for a week - becomes a free, predictable one-way bet
-    /// (short everything in the off-season). Pulling toward the last known
-    /// real anchor can move the price either way depending on which side of
-    /// it the heartbeat has wandered to, so there's no guaranteed direction
-    /// to farm.
-    ///
-    /// Closes a fixed fraction of the *current* gap each call rather than
-    /// computing an elapsed-time decay curve - simpler, self-correcting
-    /// (works regardless of how the gap got there, including heartbeat noise
-    /// still perturbing it between calls), and only meaningful given the
-    /// assumption (documented, not enforced here) that the caller invokes
-    /// this on a steady cadence. `PULL_FRACTION` is tuned for an hourly
-    /// caller: ~50% of the gap closes over 2 weeks of continued inactivity.
-    /// Never touches `last_match_update` itself - only a real event does
-    /// that - so this stays idempotent no matter how often it's called.
-    ///
-    /// `current_ts` must be **milliseconds**, matching every real-event
-    /// producer (`as_millis()` in the heartbeat/transfer/injury/live-oracle/
-    /// admin-correction loops) and `last_match_update` itself - the caller
-    /// previously passed seconds (`DateTime::timestamp()`), which meant this
-    /// gate compared a seconds-scale `current_ts` against a milliseconds-
-    /// scale `last_match_update + SEVEN_DAYS_MS`, i.e. `current_ts` was
-    /// always ~1000x smaller than the right-hand side - permanently false,
-    /// so this function never actually fired in production regardless of
-    /// the Heartbeat-freshness issue above. Confirmed by reading the actual
-    /// caller (`ssx-node/src/main.rs`'s maintenance loop) - now fixed there
-    /// to pass `timestamp_millis()`.
-    pub fn apply_stale_club_reversion(&self, current_ts: u64) {
-        const SEVEN_DAYS_MS: u64 = 7 * 24 * 60 * 60 * 1000;
-        const PULL_FRACTION: Decimal = dec!(0.002);
-
+    /// Fades every club by `fade` at once - the replay's stand-in for the
+    /// heartbeats that would have run between two events.
+    pub fn apply_result_fade(&self, fade: ResultFade) {
         for mut club in self.club_states.iter_mut() {
-            if current_ts <= club.last_match_update + SEVEN_DAYS_MS {
-                continue;
-            }
-            let Some(resting_value) = club.resting_value else { continue };
-            let gap = resting_value - club.intrinsic_value;
-            if gap == Decimal::ZERO {
-                continue;
-            }
-            club.intrinsic_value += gap * PULL_FRACTION;
-            self.notify(EngineUpdate::Club { id: club.id, state: club.clone(), ts: current_ts });
+            club.apply_fade(fade);
         }
     }
 
@@ -480,9 +526,7 @@ impl ValuationEngine {
     /// from within this function itself. Prevents runaway cascades through
     /// rivalry chains or cycles. Does not touch `last_match_update`/
     /// `resting_value` for the reactor - spillover isn't the reactor's own
-    /// real match activity, and touching either would incorrectly suppress
-    /// `apply_stale_club_reversion` for a club that hasn't actually played,
-    /// just because a rival did.
+    /// real match activity.
     fn apply_rivalry_spillover(&self, mover_id: ClubId, exclude_id: ClubId, signed_delta_pct: Decimal, current_ts: u64) {
         self.rivalry_spillover(mover_id, exclude_id, signed_delta_pct, current_ts, false);
     }
@@ -551,7 +595,7 @@ impl ValuationEngine {
             let base_value = club.intrinsic_value;
             club.intrinsic_value = scale(base_value, scorer_impact_pct, undo);
             club.last_match_update = current_ts;
-            club.resting_value = Some(club.intrinsic_value);
+            club.anchor_resting_value();
             self.notify(EngineUpdate::Club { id: team_id, state: club.clone(), ts: current_ts });
         }
         self.rivalry_spillover(team_id, opponent_id, scorer_impact_pct, current_ts, undo);
@@ -574,7 +618,7 @@ impl ValuationEngine {
             let base_value = opponent_club.intrinsic_value;
             opponent_club.intrinsic_value = scale(base_value, -conceder_impact_pct, undo);
             opponent_club.last_match_update = current_ts;
-            opponent_club.resting_value = Some(opponent_club.intrinsic_value);
+            opponent_club.anchor_resting_value();
             self.notify(EngineUpdate::Club { id: opponent_id, state: opponent_club.clone(), ts: current_ts });
         }
         self.rivalry_spillover(opponent_id, team_id, -conceder_impact_pct, current_ts, undo);
@@ -610,7 +654,7 @@ impl ValuationEngine {
                 club.intrinsic_value = scale(club.intrinsic_value, pct, true);
                 club.disciplinary_impact_this_match -= pct;
                 club.last_match_update = current_ts;
-                club.resting_value = Some(club.intrinsic_value);
+                club.anchor_resting_value();
                 self.notify(EngineUpdate::Club { id: club_id, state: club.clone(), ts: current_ts });
             }
         }
@@ -647,7 +691,7 @@ impl ValuationEngine {
                     let base_value = club.intrinsic_value;
                     club.intrinsic_value += base_value * carded_impact_pct;
                     club.last_match_update = current_ts;
-                    club.resting_value = Some(club.intrinsic_value);
+                    club.anchor_resting_value();
                     self.notify(EngineUpdate::Club { id: team_id, state: club.clone(), ts: current_ts });
                 }
                 self.apply_rivalry_spillover(team_id, opponent_id, carded_impact_pct, current_ts);
@@ -669,7 +713,7 @@ impl ValuationEngine {
                     let base_value = opponent_club.intrinsic_value;
                     opponent_club.intrinsic_value += base_value * benefiting_impact_pct;
                     opponent_club.last_match_update = current_ts;
-                    opponent_club.resting_value = Some(opponent_club.intrinsic_value);
+                    opponent_club.anchor_resting_value();
                     self.notify(EngineUpdate::Club { id: opponent_id, state: opponent_club.clone(), ts: current_ts });
                 }
                 self.apply_rivalry_spillover(opponent_id, team_id, benefiting_impact_pct, current_ts);
@@ -703,7 +747,7 @@ impl ValuationEngine {
                     let base_value = club.intrinsic_value;
                     club.intrinsic_value += base_value * carded_impact_pct;
                     club.last_match_update = current_ts;
-                    club.resting_value = Some(club.intrinsic_value);
+                    club.anchor_resting_value();
                     self.notify(EngineUpdate::Club { id: team_id, state: club.clone(), ts: current_ts });
                 }
                 self.apply_rivalry_spillover(team_id, opponent_id, carded_impact_pct, current_ts);
@@ -718,7 +762,7 @@ impl ValuationEngine {
                     let base_value = opponent_club.intrinsic_value;
                     opponent_club.intrinsic_value += base_value * benefiting_impact_pct;
                     opponent_club.last_match_update = current_ts;
-                    opponent_club.resting_value = Some(opponent_club.intrinsic_value);
+                    opponent_club.anchor_resting_value();
                     self.notify(EngineUpdate::Club { id: opponent_id, state: opponent_club.clone(), ts: current_ts });
                 }
                 self.apply_rivalry_spillover(opponent_id, team_id, benefiting_impact_pct, current_ts);
@@ -740,7 +784,7 @@ impl ValuationEngine {
                 for &team_id in &[team_a_id, team_b_id] {
                     if let Some(mut club) = self.club_states.get_mut(&team_id) {
                         club.last_match_update = current_ts;
-                        club.resting_value = Some(club.intrinsic_value);
+                        club.anchor_resting_value();
                         // Fresh disciplinary headroom for the next match -
                         // see MAX_DISCIPLINARY_IMPACT_PCT_PER_MATCH.
                         club.disciplinary_impact_this_match = Decimal::ZERO;
@@ -782,36 +826,43 @@ impl ValuationEngine {
                     }
                 }
             }
-            MatchEvent::Heartbeat { team_id, tick_std_pct } => {
+            MatchEvent::Heartbeat { team_id, noise, fade } => {
                 if let Some(mut club) = self.club_states.get_mut(&team_id) {
+                    club.apply_fade(fade);
                     // Deliberately NOT touching last_match_update here -
-                    // Heartbeat fires for every club every ~2s regardless of
-                    // real match activity, so stamping it here meant
-                    // apply_stale_club_reversion's "hasn't had a real event
-                    // in 7 days" gate could never open in practice (confirmed
-                    // live: it was permanently unreachable). last_match_update
-                    // is reserved for real events (Goal/Card/WhistleEnd/
+                    // it's reserved for real events (Goal/Card/WhistleEnd/
                     // AdminCorrection/Transfer) - see EngineUpdate::Club's
                     // own `ts` field for the "always fresh, every tick"
                     // timestamp live price-history storage actually needs.
 
-                    // Live Market Simulation: driftless geometric random walk -
-                    // see heartbeat_multiplier's own comment for why this must
-                    // be exp(shock), not 1.0 + shock, and
-                    // heartbeat_tick_half_width's for where tick_std_pct comes
-                    // from (a calibrated target, not a hand-picked constant).
-                    // `gen_range` panics on an empty range, so a misconfigured
-                    // (or deliberately zero) volatility target skips the draw
-                    // entirely rather than crashing this tick for every club -
-                    // zero volatility legitimately means "no noise," not an
-                    // error.
-                    if tick_std_pct > 0.0 {
+                    // Only the change in the deviation touches the price, so
+                    // the fundamental underneath is never moved by noise.
+                    let draw = if noise.shock_half_width > 0.0 {
                         use rand::Rng;
-                        let mut rng = rand::thread_rng();
-                        let shock: f64 = rng.gen_range(-tick_std_pct..tick_std_pct);
-                        club.intrinsic_value *= heartbeat_multiplier(shock);
-                    }
+                        rand::thread_rng().gen_range(-1.0..1.0)
+                    } else {
+                        0.0
+                    };
+                    let next = noise.step(club.noise_log, draw);
+                    let step = heartbeat_multiplier(next - club.noise_log);
+                    club.intrinsic_value *= step;
+                    club.noise_log = next;
+                    club.step_repricing();
 
+                    self.notify(EngineUpdate::Club { id: team_id, state: club.clone(), ts: current_ts });
+                }
+            }
+            MatchEvent::Repricing { team_id, ln_delta, ticks } => {
+                if let Some(mut club) = self.club_states.get_mut(&team_id) {
+                    if ticks == 0 {
+                        let factor = heartbeat_multiplier(ln_delta);
+                        club.intrinsic_value *= factor;
+                    } else {
+                        club.repricing_ln_remaining += ln_delta;
+                        club.repricing_ticks_remaining = club.repricing_ticks_remaining.max(ticks);
+                    }
+                    club.last_match_update = current_ts;
+                    club.anchor_resting_value();
                     self.notify(EngineUpdate::Club { id: team_id, state: club.clone(), ts: current_ts });
                 }
             }
@@ -819,11 +870,7 @@ impl ValuationEngine {
                 if let Some(mut club) = self.club_states.get_mut(&team_id) {
                     club.intrinsic_value *= dec!(1.0) + delta_pct / dec!(100.0);
                     club.last_match_update = current_ts;
-                    // Same reasoning as every real event handler above -
-                    // anchor resting_value to the corrected value so
-                    // apply_stale_club_reversion has no stale target to
-                    // fight this back toward.
-                    club.resting_value = Some(club.intrinsic_value);
+                    club.anchor_resting_value();
                     self.notify(EngineUpdate::Club { id: team_id, state: club.clone(), ts: current_ts });
                 }
             }
@@ -1508,64 +1555,226 @@ mod heartbeat_drift_tests {
 }
 
 #[cfg(test)]
-mod heartbeat_calibration_tests {
+mod heartbeat_noise_tests {
     use super::*;
 
-    #[test]
-    fn the_target_is_held_to_its_ceiling() {
-        assert_eq!(bounded_heartbeat_volatility(0.10), 0.10);
-        assert_eq!(bounded_heartbeat_volatility(1.0), 1.0);
-        assert_eq!(bounded_heartbeat_volatility(10.0), MAX_HEARTBEAT_MONTHLY_VOLATILITY, "a typo is held to the ceiling");
-        assert_eq!(bounded_heartbeat_volatility(-0.5), 0.0);
-        assert_eq!(bounded_heartbeat_volatility(f64::NAN), 0.0);
+    const TICK_SECS: f64 = 2.0;
+    const HOUR: f64 = 3600.0;
+
+    fn engine_with_club(value: Decimal) -> (ValuationEngine, ClubId) {
+        let engine = ValuationEngine::new();
+        let id = ClubId(1);
+        let mut club = ClubState::new(id);
+        club.intrinsic_value = value;
+        club.resting_value = Some(value);
+        engine.club_states.insert(id, club);
+        (engine, id)
     }
 
-    /// Round-trips the derivation: given the half-width `a` this function
-    /// returns for a target, compounding N ticks' worth of that magnitude's
-    /// variance should reproduce the target's variance - the actual
-    /// mathematical property that makes "target monthly volatility" a
-    /// meaningful, honest parameter rather than just a differently-shaped
-    /// magic number.
-    #[test]
-    fn compounding_the_derived_half_width_reproduces_the_target_variance() {
-        let target = 0.05; // 5% monthly
-        let interval_secs = 2.0;
-        let a = heartbeat_tick_half_width(target, interval_secs);
-
-        let ticks_per_month = 30.0 * 24.0 * 3600.0 / interval_secs;
-        let per_tick_variance = (a / 3f64.sqrt()).powi(2);
-        let compounded_variance = ticks_per_month * per_tick_variance;
-        let implied_monthly_std = compounded_variance.sqrt();
-
-        let diff = (implied_monthly_std - target).abs();
-        assert!(diff < 1e-9, "expected compounding the derived half-width to reproduce the {target} target, got {implied_monthly_std}");
-    }
-
-    /// The actual production default (5% monthly @ 2s) should land far
-    /// below the old, uncalibrated 0.0005 (~33% monthly, see AGENTS.md's
-    /// "Known gotchas") - the whole point of this function.
-    #[test]
-    fn default_calibration_is_far_smaller_than_the_old_uncalibrated_constant() {
-        let a = heartbeat_tick_half_width(0.05, 2.0);
-        assert!(a < 0.0005, "expected the calibrated half-width to be well under the old hardcoded 0.0005, got {a}");
-    }
-
-    /// Halving the interval doubles ticks/month, so - to hold the same
-    /// target monthly volatility - the per-tick half-width must shrink by
-    /// sqrt(2), not stay fixed. This is precisely the coupling that was
-    /// missing before: the interval and the magnitude must move together.
-    #[test]
-    fn a_faster_interval_requires_a_smaller_half_width_for_the_same_target() {
-        let target = 0.05;
-        let a_slow = heartbeat_tick_half_width(target, 2.0);
-        let a_fast = heartbeat_tick_half_width(target, 1.0); // half the interval
-        let ratio = a_slow / a_fast;
-        assert!((ratio - 2f64.sqrt()).abs() < 1e-9, "expected a sqrt(2) ratio, got {ratio}");
+    fn tick(engine: &ValuationEngine, id: ClubId, noise: HeartbeatNoise, n: usize) {
+        for _ in 0..n {
+            engine.process_event(MatchEvent::Heartbeat { team_id: id, noise, fade: ResultFade::NONE }, 0);
+        }
     }
 
     #[test]
-    fn zero_target_volatility_gives_zero_half_width() {
-        assert_eq!(heartbeat_tick_half_width(0.0, 2.0), 0.0);
+    fn calibration_settles_at_the_requested_band() {
+        let noise = HeartbeatNoise::calibrate(0.03, HOUR, TICK_SECS);
+        let per_tick_variance = noise.shock_half_width.powi(2) / 3.0;
+        let stationary_std = (per_tick_variance / (1.0 - noise.keep.powi(2))).sqrt();
+        assert!((stationary_std - 0.03).abs() < 1e-12, "got {stationary_std}");
+    }
+
+    #[test]
+    fn a_deviation_halves_over_one_half_life_without_new_shocks() {
+        let noise = HeartbeatNoise::calibrate(0.03, HOUR, TICK_SECS);
+        let mut x = 0.1;
+        for _ in 0..(HOUR / TICK_SECS) as usize {
+            x = noise.step(x, 0.0);
+        }
+        assert!((x - 0.05).abs() < 1e-9, "got {x}");
+    }
+
+    #[test]
+    fn the_band_is_held_to_its_ceiling_and_nonsense_means_no_new_noise() {
+        let capped = HeartbeatNoise::calibrate(3.0, HOUR, TICK_SECS);
+        assert_eq!(capped, HeartbeatNoise::calibrate(MAX_HEARTBEAT_NOISE_BAND, HOUR, TICK_SECS));
+        assert_eq!(HeartbeatNoise::calibrate(f64::NAN, HOUR, TICK_SECS).shock_half_width, 0.0);
+        assert_eq!(HeartbeatNoise::calibrate(-1.0, HOUR, TICK_SECS).shock_half_width, 0.0);
+    }
+
+    /// The bug this replaced: a month of ticks used to leave a club anywhere
+    /// from a fraction to many times its value. Now it stays within a few
+    /// bands of where it started, and the fundamental doesn't move at all.
+    #[test]
+    fn a_month_without_matches_stays_near_the_fundamental() {
+        let noise = HeartbeatNoise::calibrate(0.03, HOUR, TICK_SECS);
+        let ticks = (30.0 * 24.0 * HOUR / TICK_SECS) as usize;
+        let (engine, id) = engine_with_club(dec!(1000));
+        let mut worst: f64 = 0.0;
+        for _ in 0..ticks / 1000 {
+            tick(&engine, id, noise, 1000);
+            worst = worst.max(engine.club_states.get(&id).unwrap().noise_log.abs());
+        }
+        let club = engine.club_states.get(&id).unwrap();
+        assert!(worst < 0.03 * 6.0, "deviation reached {worst}");
+        assert!((club.fundamental_value() - dec!(1000)).abs() < dec!(0.000001), "fundamental moved to {}", club.fundamental_value());
+    }
+
+    #[test]
+    fn a_goal_during_noise_moves_the_fundamental_by_exactly_its_own_amount() {
+        let noise = HeartbeatNoise::calibrate(0.03, HOUR, TICK_SECS);
+        let (engine, scorer) = engine_with_club(dec!(1000));
+        let mut other = ClubState::new(ClubId(2));
+        other.intrinsic_value = dec!(1000);
+        engine.club_states.insert(ClubId(2), other);
+        tick(&engine, scorer, noise, 500);
+        engine.process_event(MatchEvent::Goal { team_id: scorer, opponent_id: ClubId(2), player_id: PlayerId(0), minute: 45 }, 0);
+        tick(&engine, scorer, noise, 500);
+        let club = engine.club_states.get(&scorer).unwrap();
+        let expected = dec!(1000) * (Decimal::ONE + GOAL_BASE_IMPACT_PCT + GOAL_LATE_IMPACT_PCT * dec!(0.5));
+        assert!((club.fundamental_value() - expected).abs() < dec!(0.000001), "got {}", club.fundamental_value());
+        assert_eq!(club.resting_value.map(|r| (r - expected).abs() < dec!(0.000001)), Some(true), "anchor should be the fundamental, not the noisy price");
+    }
+
+    #[test]
+    fn a_zero_band_fades_existing_noise_out_instead_of_freezing_it() {
+        let (engine, id) = engine_with_club(dec!(1000));
+        {
+            let mut club = engine.club_states.get_mut(&id).unwrap();
+            club.noise_log = 0.1;
+            club.intrinsic_value = dec!(1000) * heartbeat_multiplier(0.1);
+        }
+        tick(&engine, id, HeartbeatNoise::calibrate(0.0, HOUR, TICK_SECS), (4.0 * HOUR / TICK_SECS) as usize);
+        let club = engine.club_states.get(&id).unwrap();
+        assert!((club.noise_log - 0.1 / 16.0).abs() < 1e-9, "got {}", club.noise_log);
+        assert!((club.fundamental_value() - dec!(1000)).abs() < dec!(0.000001));
+    }
+
+    #[test]
+    fn a_repricing_lands_exactly_on_target_over_its_ticks_with_noise_running() {
+        let noise = HeartbeatNoise::calibrate(0.05, 1800.0, TICK_SECS);
+        let (engine, id) = engine_with_club(dec!(95000));
+        tick(&engine, id, noise, 200);
+        let start = engine.club_states.get(&id).unwrap().fundamental_value();
+        let ln_delta = (1000.0f64 / 95000.0).ln();
+        engine.process_event(MatchEvent::Repricing { team_id: id, ln_delta, ticks: 100 }, 1);
+        tick(&engine, id, noise, 50);
+        {
+            let club = engine.club_states.get(&id).unwrap();
+            assert!(club.is_repricing());
+            let halfway = start * heartbeat_multiplier(ln_delta / 2.0);
+            assert!((club.fundamental_value() / halfway - Decimal::ONE).abs() < dec!(0.000001), "halfway at {}", club.fundamental_value());
+        }
+        tick(&engine, id, noise, 60);
+        let club = engine.club_states.get(&id).unwrap();
+        assert!(!club.is_repricing());
+        let target = start * heartbeat_multiplier(ln_delta);
+        assert!((club.fundamental_value() / target - Decimal::ONE).abs() < dec!(0.000001), "ended at {} not {}", club.fundamental_value(), target);
+        assert!((club.resting_value.unwrap() / target - Decimal::ONE).abs() < dec!(0.000001), "anchor should follow the repricing");
+    }
+
+    #[test]
+    fn a_goal_mid_repricing_still_counts_in_full() {
+        let (engine, id) = engine_with_club(dec!(1000));
+        let mut other = ClubState::new(ClubId(2));
+        other.intrinsic_value = dec!(1000);
+        engine.club_states.insert(ClubId(2), other);
+        engine.process_event(MatchEvent::Repricing { team_id: id, ln_delta: 2f64.ln(), ticks: 10 }, 0);
+        tick(&engine, id, HeartbeatNoise::calibrate(0.0, 1800.0, TICK_SECS), 5);
+        engine.process_event(MatchEvent::Goal { team_id: id, opponent_id: ClubId(2), player_id: PlayerId(0), minute: 0 }, 0);
+        tick(&engine, id, HeartbeatNoise::calibrate(0.0, 1800.0, TICK_SECS), 5);
+        let expected = dec!(2000) * (Decimal::ONE + GOAL_BASE_IMPACT_PCT);
+        let got = engine.club_states.get(&id).unwrap().fundamental_value();
+        assert!((got / expected - Decimal::ONE).abs() < dec!(0.000001), "got {got}, expected {expected}");
+    }
+
+    #[test]
+    fn a_repricing_with_no_ticks_lands_at_once() {
+        let (engine, id) = engine_with_club(dec!(1000));
+        engine.process_event(MatchEvent::Repricing { team_id: id, ln_delta: 2f64.ln(), ticks: 0 }, 0);
+        let club = engine.club_states.get(&id).unwrap();
+        assert!(!club.is_repricing());
+        assert!((club.intrinsic_value - dec!(2000)).abs() < dec!(0.000001));
+    }
+
+    fn anchored(value: Decimal, anchor: Decimal) -> (ValuationEngine, ClubId) {
+        let (engine, id) = engine_with_club(value);
+        engine.club_states.get_mut(&id).unwrap().anchor_value = Some(anchor);
+        (engine, id)
+    }
+
+    #[test]
+    fn old_results_halve_their_distance_from_the_anchor_every_half_life() {
+        let (engine, id) = anchored(dec!(4000), dec!(1000));
+        let fade = ResultFade::calibrate(60.0 * 86_400.0, 86_400.0);
+        for _ in 0..60 {
+            engine.process_event(MatchEvent::Heartbeat { team_id: id, noise: HeartbeatNoise::calibrate(0.0, 1800.0, 2.0), fade }, 0);
+        }
+        let got = engine.club_states.get(&id).unwrap().fundamental_value();
+        assert!((got - dec!(2000)).abs() < dec!(0.001), "4x the anchor should be 2x after one half-life, got {got}");
+    }
+
+    #[test]
+    fn a_club_below_its_anchor_fades_back_up_the_same_way() {
+        let (engine, id) = anchored(dec!(250), dec!(1000));
+        engine.apply_result_fade(ResultFade { keep: 0.5 });
+        let got = engine.club_states.get(&id).unwrap().fundamental_value();
+        assert!((got - dec!(500)).abs() < dec!(0.001), "got {got}");
+    }
+
+    #[test]
+    fn fading_leaves_the_noise_alone() {
+        let (engine, id) = anchored(dec!(4000), dec!(1000));
+        {
+            let mut club = engine.club_states.get_mut(&id).unwrap();
+            club.noise_log = 0.04;
+            club.intrinsic_value = dec!(4000) * heartbeat_multiplier(0.04);
+        }
+        engine.apply_result_fade(ResultFade { keep: 0.5 });
+        let club = engine.club_states.get(&id).unwrap();
+        assert_eq!(club.noise_log, 0.04);
+        assert!((club.fundamental_value() - dec!(2000)).abs() < dec!(0.001), "got {}", club.fundamental_value());
+    }
+
+    /// Two clubs with the same results in the same weeks end up the same
+    /// distance from their anchors, whichever was ahead before - no handicap.
+    #[test]
+    fn the_same_goals_at_the_same_time_are_worth_the_same_to_a_leader_and_a_chaser() {
+        let engine = ValuationEngine::new();
+        for (id, value) in [(1, dec!(3000)), (2, dec!(1000)), (9, dec!(1000))] {
+            let mut club = ClubState::new(ClubId(id));
+            club.intrinsic_value = value;
+            club.anchor_value = Some(dec!(1000));
+            engine.club_states.insert(ClubId(id), club);
+        }
+        let before: Vec<Decimal> = [1, 2].iter().map(|id| engine.club_states.get(&ClubId(*id)).unwrap().fundamental_value()).collect();
+        for id in [1, 2] {
+            engine.process_event(MatchEvent::Goal { team_id: ClubId(id), opponent_id: ClubId(9), player_id: PlayerId(0), minute: 45 }, 0);
+        }
+        engine.apply_result_fade(ResultFade { keep: 0.9 });
+        let gain = |id: u32, b: Decimal| {
+            use rust_decimal::prelude::ToPrimitive;
+            let anchor = 1000.0;
+            let after = engine.club_states.get(&ClubId(id)).unwrap().fundamental_value().to_f64().unwrap();
+            (after / anchor).ln() - 0.9 * (b.to_f64().unwrap() / anchor).ln()
+        };
+        assert!((gain(1, before[0]) - gain(2, before[1])).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_club_without_an_anchor_never_fades() {
+        let (engine, id) = engine_with_club(dec!(4000));
+        engine.apply_result_fade(ResultFade { keep: 0.5 });
+        assert_eq!(engine.club_states.get(&id).unwrap().intrinsic_value, dec!(4000));
+    }
+
+    #[test]
+    fn a_redis_record_from_before_this_field_reads_as_no_noise() {
+        let mut json = serde_json::to_value(ClubState::new(ClubId(1))).unwrap();
+        json.as_object_mut().unwrap().remove("noise_log");
+        let club: ClubState = serde_json::from_value(json).unwrap();
+        assert_eq!(club.noise_log, 0.0);
     }
 }
 
@@ -1600,11 +1809,6 @@ mod admin_correction_tests {
         assert_eq!(club.intrinsic_value, dec!(750.0));
     }
 
-    /// The property that actually matters operationally: without this, the
-    /// very next `apply_stale_club_reversion` pass would see a gap between
-    /// the (now-stale) resting_value and the corrected intrinsic_value and
-    /// start pulling the correction straight back toward the pre-correction
-    /// number - silently undoing the fix it was meant to apply.
     #[test]
     fn resting_value_is_anchored_to_the_corrected_value_not_left_stale() {
         let (engine, club_id) = engine_with_club(dec!(1000.0));
@@ -1630,114 +1834,6 @@ mod admin_correction_tests {
 }
 
 #[cfg(test)]
-mod stale_club_reversion_tests {
-    use super::*;
-
-    const SEVEN_DAYS_MS: u64 = 7 * 24 * 60 * 60 * 1000;
-
-    fn club_with(intrinsic_value: Decimal, resting_value: Decimal, last_match_update: u64) -> (ValuationEngine, ClubId) {
-        let engine = ValuationEngine::new();
-        let club_id = ClubId(1);
-        let mut club = ClubState::new(club_id);
-        club.intrinsic_value = intrinsic_value;
-        club.resting_value = Some(resting_value);
-        club.last_match_update = last_match_update;
-        engine.club_states.insert(club_id, club);
-        (engine, club_id)
-    }
-
-    /// The key fix: a club sitting *above* its resting anchor gets pulled
-    /// down, proving this isn't the old one-directional decay.
-    #[test]
-    fn pulls_down_toward_resting_value_when_above_it() {
-        let (engine, club_id) = club_with(dec!(120.0), dec!(100.0), 0);
-        engine.apply_stale_club_reversion(SEVEN_DAYS_MS + 3_600_000);
-        let value = engine.club_states.get(&club_id).unwrap().intrinsic_value;
-        assert!(value < dec!(120.0) && value > dec!(100.0), "expected a partial pull down toward 100.0, got {value}");
-    }
-
-    /// And a club sitting *below* its resting anchor gets pulled up - this is
-    /// the case the old always-multiply-down implementation could never do,
-    /// and the whole reason it was a farmable, one-way bet during a long
-    /// quiet spell.
-    #[test]
-    fn pulls_up_toward_resting_value_when_below_it() {
-        let (engine, club_id) = club_with(dec!(80.0), dec!(100.0), 0);
-        engine.apply_stale_club_reversion(SEVEN_DAYS_MS + 3_600_000);
-        let value = engine.club_states.get(&club_id).unwrap().intrinsic_value;
-        assert!(value > dec!(80.0) && value < dec!(100.0), "expected a partial pull up toward 100.0, got {value}");
-    }
-
-    #[test]
-    fn does_nothing_within_the_seven_day_grace_period() {
-        let (engine, club_id) = club_with(dec!(120.0), dec!(100.0), 0);
-        engine.apply_stale_club_reversion(SEVEN_DAYS_MS - 3_600_000); // one hour short of the gate
-        let value = engine.club_states.get(&club_id).unwrap().intrinsic_value;
-        assert_eq!(value, dec!(120.0));
-    }
-
-    #[test]
-    fn does_nothing_once_already_at_the_resting_value() {
-        let (engine, club_id) = club_with(dec!(100.0), dec!(100.0), 0);
-        engine.apply_stale_club_reversion(SEVEN_DAYS_MS + 3_600_000);
-        let value = engine.club_states.get(&club_id).unwrap().intrinsic_value;
-        assert_eq!(value, dec!(100.0));
-    }
-
-    /// Never touches `last_match_update` - repeated calls keep pulling
-    /// (idempotent w.r.t. the gate), rather than the original bug where
-    /// resetting it inside the function meant a fresh 7-day wait was needed
-    /// before the *next* single dose of decay.
-    #[test]
-    fn repeated_calls_keep_converging_without_resetting_the_gate() {
-        let (engine, club_id) = club_with(dec!(120.0), dec!(100.0), 0);
-        let mut last_value = dec!(120.0);
-        for _ in 0..5 {
-            engine.apply_stale_club_reversion(SEVEN_DAYS_MS + 3_600_000);
-            let value = engine.club_states.get(&club_id).unwrap().intrinsic_value;
-            assert!(value < last_value, "expected continued convergence toward 100.0, got {value} after {last_value}");
-            last_value = value;
-        }
-    }
-
-    #[test]
-    fn a_club_with_no_resting_value_yet_is_left_untouched() {
-        let (engine, club_id) = club_with(dec!(120.0), dec!(100.0), 0);
-        engine.club_states.get_mut(&club_id).unwrap().resting_value = None; // simulates a pre-migration Redis record
-        engine.apply_stale_club_reversion(SEVEN_DAYS_MS + 3_600_000);
-        let value = engine.club_states.get(&club_id).unwrap().intrinsic_value;
-        assert_eq!(value, dec!(120.0));
-    }
-
-    /// Regression test for a real production bug: the caller
-    /// (`ssx-node`'s maintenance loop) used to pass **seconds**
-    /// (`DateTime::timestamp()`) while `last_match_update` and every real-
-    /// event producer use **milliseconds** (`as_millis()`), so this gate
-    /// compared a seconds-scale `current_ts` against a milliseconds-scale
-    /// `last_match_update + SEVEN_DAYS_MS` - always false, so this function
-    /// never fired in production regardless of real inactivity. The tests
-    /// above use small, internally-consistent synthetic timestamps that
-    /// stay correct under either unit convention and would NOT have caught
-    /// that bug (or a regression of it) - this test uses timestamps at the
-    /// actual epoch-millisecond scale `SystemTime::now()...as_millis()`
-    /// really produces, which only lines up correctly if the caller is
-    /// genuinely passing milliseconds.
-    #[test]
-    fn fires_correctly_at_realistic_epoch_millisecond_scale() {
-        // A real millisecond epoch timestamp (some arbitrary moment), not a
-        // small offset-from-zero synthetic value.
-        const REALISTIC_NOW_MS: u64 = 1_787_000_000_000;
-        let (engine, club_id) = club_with(dec!(120.0), dec!(100.0), REALISTIC_NOW_MS - SEVEN_DAYS_MS - 3_600_000);
-        engine.apply_stale_club_reversion(REALISTIC_NOW_MS);
-        let value = engine.club_states.get(&club_id).unwrap().intrinsic_value;
-        assert!(
-            value < dec!(120.0),
-            "a club whose last real event was over 7 real days before `current_ts` (both at realistic millisecond-epoch scale) should have been pulled down toward resting_value, got {value} unchanged"
-        );
-    }
-}
-
-#[cfg(test)]
 mod heartbeat_publish_timestamp_tests {
     use super::*;
 
@@ -1756,7 +1852,7 @@ mod heartbeat_publish_timestamp_tests {
         let club_id = ClubId(1);
         engine.club_states.insert(club_id, ClubState::new(club_id));
 
-        engine.process_event(MatchEvent::Heartbeat { team_id: club_id, tick_std_pct: 0.0 }, 555_000);
+        engine.process_event(MatchEvent::Heartbeat { team_id: club_id, noise: HeartbeatNoise::calibrate(0.0, 3600.0, 2.0), fade: ResultFade::NONE }, 555_000);
 
         let club = engine.club_states.get(&club_id).unwrap();
         assert_eq!(club.last_match_update, 0, "Heartbeat must not touch last_match_update - only a real event does");

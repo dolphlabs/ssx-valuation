@@ -20,6 +20,10 @@ pub mod southampton;
 pub mod tottenham;
 pub mod west_ham;
 pub mod wolves;
+pub mod leeds;
+pub mod sunderland;
+pub mod hull_city;
+pub mod coventry;
 
 pub fn seed(engine: &mut ValuationEngine) {
     arsenal::seed(engine);
@@ -42,4 +46,8 @@ pub fn seed(engine: &mut ValuationEngine) {
     tottenham::seed(engine);
     west_ham::seed(engine);
     wolves::seed(engine);
+    leeds::seed(engine);
+    sunderland::seed(engine);
+    hull_city::seed(engine);
+    coventry::seed(engine);
 }

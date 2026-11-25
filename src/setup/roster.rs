@@ -1,11 +1,11 @@
-use serde::Serialize;
+use serde::ser::{Serialize, SerializeStruct, Serializer};
 
 /// Canonical, customer-facing metadata for a club: display name, ticker
 /// (short code), and league. This is the single source of truth consumed by
 /// `ssx-node` (which publishes it to Redis at boot) and, transitively, by the
 /// frontend's pair picker — nothing downstream should hardcode club names or
 /// short codes of its own.
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy)]
 pub struct ClubMeta {
     pub id: u32,
     pub name: &'static str,
@@ -19,6 +19,29 @@ pub struct ClubMeta {
     /// scoreboard in the terminal. Text colour on top of it is picked for
     /// contrast client-side, so light kits (Fulham, Juventus) stay legible.
     pub color: &'static str,
+}
+
+impl ClubMeta {
+    /// In its league's top flight this season. A relegated club stays in the
+    /// roster - positions, history and fan picks still point at it - but is
+    /// frozen: no heartbeat, no new positions, and left out of every list.
+    pub fn active(&self) -> bool {
+        crate::api_football::team_map::is_in_current_top_flight(crate::ClubId(self.id))
+    }
+}
+
+impl Serialize for ClubMeta {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut s = serializer.serialize_struct("ClubMeta", 7)?;
+        s.serialize_field("id", &self.id)?;
+        s.serialize_field("name", self.name)?;
+        s.serialize_field("short_name", self.short_name)?;
+        s.serialize_field("short_code", self.short_code)?;
+        s.serialize_field("league", self.league)?;
+        s.serialize_field("color", self.color)?;
+        s.serialize_field("active", &self.active())?;
+        s.end()
+    }
 }
 
 const PL: &str = "Premier League";
@@ -129,6 +152,27 @@ pub const ROSTER: &[ClubMeta] = &[
     ClubMeta { id: 5016, name: "AJ Auxerre", short_name: "Auxerre", short_code: "AUX", league: LIGUE_1, color: "#005BAC" },
     ClubMeta { id: 5017, name: "Angers SCO", short_name: "Angers", short_code: "ANG", league: LIGUE_1, color: "#E6E6E6" },
     ClubMeta { id: 5018, name: "AS Saint-Etienne", short_name: "Saint-Etienne", short_code: "STE", league: LIGUE_1, color: "#00A859" },
+    // Promoted for 2026/27
+    ClubMeta { id: 21, name: "Leeds United", short_name: "Leeds", short_code: "LEE", league: PL, color: "#FFFFFF" },
+    ClubMeta { id: 22, name: "Sunderland", short_name: "Sunderland", short_code: "SUN", league: PL, color: "#EB172B" },
+    ClubMeta { id: 23, name: "Hull City", short_name: "Hull", short_code: "HUL", league: PL, color: "#F5A12D" },
+    ClubMeta { id: 24, name: "Coventry City", short_name: "Coventry", short_code: "COV", league: PL, color: "#6CB4EE" },
+    ClubMeta { id: 2021, name: "Levante UD", short_name: "Levante", short_code: "LVT", league: LA_LIGA, color: "#004494" },
+    ClubMeta { id: 2022, name: "Elche CF", short_name: "Elche", short_code: "ELC", league: LA_LIGA, color: "#05642C" },
+    ClubMeta { id: 2023, name: "Malaga CF", short_name: "Malaga", short_code: "MAL", league: LA_LIGA, color: "#009FE3" },
+    ClubMeta { id: 2024, name: "Deportivo La Coruna", short_name: "Deportivo", short_code: "DEP", league: LA_LIGA, color: "#0055A4" },
+    ClubMeta { id: 2025, name: "Racing Santander", short_name: "Racing", short_code: "RAC", league: LA_LIGA, color: "#00873E" },
+    ClubMeta { id: 3021, name: "Sassuolo", short_name: "Sassuolo", short_code: "SAS", league: SERIE_A, color: "#00A752" },
+    ClubMeta { id: 3022, name: "Frosinone", short_name: "Frosinone", short_code: "FRO", league: SERIE_A, color: "#FFDD00" },
+    ClubMeta { id: 4019, name: "Hamburger SV", short_name: "Hamburg", short_code: "HSV", league: BUNDESLIGA, color: "#0A3F86" },
+    ClubMeta { id: 4020, name: "1. FC Koln", short_name: "Koln", short_code: "KOE", league: BUNDESLIGA, color: "#ED1C24" },
+    ClubMeta { id: 4021, name: "FC Schalke 04", short_name: "Schalke", short_code: "S04", league: BUNDESLIGA, color: "#004D9D" },
+    ClubMeta { id: 4022, name: "SC Paderborn 07", short_name: "Paderborn", short_code: "PAD", league: BUNDESLIGA, color: "#005CA9" },
+    ClubMeta { id: 4023, name: "SV Elversberg", short_name: "Elversberg", short_code: "ELV", league: BUNDESLIGA, color: "#1E1E1E" },
+    ClubMeta { id: 5019, name: "Paris FC", short_name: "Paris FC", short_code: "PFC", league: LIGUE_1, color: "#0C2340" },
+    ClubMeta { id: 5020, name: "FC Lorient", short_name: "Lorient", short_code: "LOR", league: LIGUE_1, color: "#F58113" },
+    ClubMeta { id: 5021, name: "ESTAC Troyes", short_name: "Troyes", short_code: "TRO", league: LIGUE_1, color: "#2B59A3" },
+    ClubMeta { id: 5022, name: "Le Mans FC", short_name: "Le Mans", short_code: "LMA", league: LIGUE_1, color: "#E30613" },
 ];
 
 /// The names fans give some of the seeded rivalries ("Manchester derby").
@@ -164,6 +208,15 @@ pub const DERBIES: &[(u32, u32, &str)] = &[
     (3006, 3007, "Rome derby"),
     (4002, 4005, "Der Klassiker"),
     (5001, 5008, "Le Classique"),
+    (2, 21, "Roses rivalry"),
+    (7, 22, "Tyne-Wear derby"),
+    (2009, 2021, "Valencia derby"),
+    (2013, 2024, "Galician derby"),
+    (4005, 4021, "Revierderby"),
+    (4009, 4019, "Nordderby"),
+    (4014, 4020, "Rhine derby"),
+    (5001, 5019, "Paris derby"),
+    (5010, 5020, "Breton derby"),
 ];
 
 /// The derby name for two clubs, in either order.
@@ -179,14 +232,40 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn roster_has_96_unique_entries() {
-        assert_eq!(ROSTER.len(), 96);
+    fn roster_has_116_unique_entries() {
+        assert_eq!(ROSTER.len(), 116);
 
         let ids: HashSet<u32> = ROSTER.iter().map(|c| c.id).collect();
         assert_eq!(ids.len(), ROSTER.len(), "duplicate club id in ROSTER");
 
         let codes: HashSet<&str> = ROSTER.iter().map(|c| c.short_code).collect();
         assert_eq!(codes.len(), ROSTER.len(), "duplicate short_code in ROSTER");
+    }
+
+    /// Each league's active clubs are exactly its real 2026/27 size - the
+    /// promoted clubs in, the relegated ones frozen.
+    #[test]
+    fn each_league_has_its_real_number_of_active_clubs() {
+        for (league, size) in [(PL, 20), (LA_LIGA, 20), (SERIE_A, 20), (BUNDESLIGA, 18), (LIGUE_1, 18)] {
+            let active = ROSTER.iter().filter(|c| c.league == league && c.active()).count();
+            assert_eq!(active, size, "{league}");
+        }
+    }
+
+    #[test]
+    fn every_active_club_is_mapped_to_api_football() {
+        for club in ROSTER.iter().filter(|c| c.active()) {
+            assert!(crate::api_football::team_map::api_team_for_club_id(crate::ClubId(club.id)).is_some(), "{} isn't in TEAM_MAP", club.name);
+        }
+    }
+
+    #[test]
+    fn the_roster_json_says_whether_a_club_is_active() {
+        let json = serde_json::to_value(ROSTER).unwrap();
+        let by_id = |id: u32| json.as_array().unwrap().iter().find(|c| c["id"] == id).unwrap().clone();
+        assert_eq!(by_id(4021)["active"], true, "Schalke were promoted");
+        assert_eq!(by_id(9)["active"], false, "West Ham went down");
+        assert_eq!(by_id(4021)["short_code"], "S04");
     }
 
     #[test]

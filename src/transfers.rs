@@ -162,10 +162,7 @@ impl ValuationEngine {
                 };
                 club.intrinsic_value += delta;
                 club.last_match_update = current_ts;
-                // Same reasoning as every other real-event handler - anchor
-                // resting_value so apply_stale_club_reversion has no stale
-                // (pre-transfer) target to pull this club back toward.
-                club.resting_value = Some(club.intrinsic_value);
+                club.anchor_resting_value();
                 self.notify(EngineUpdate::Club { id: to_club, state: club.clone(), ts: current_ts });
             }
         }
@@ -177,7 +174,7 @@ impl ValuationEngine {
                 };
                 club.intrinsic_value -= delta;
                 club.last_match_update = current_ts;
-                club.resting_value = Some(club.intrinsic_value);
+                club.anchor_resting_value();
                 self.notify(EngineUpdate::Club { id: from_club, state: club.clone(), ts: current_ts });
             }
         }
@@ -277,11 +274,6 @@ mod tests {
 
     #[test]
     fn resting_value_is_anchored_on_both_sides_of_a_transfer() {
-        // Matches every other real-event handler (Goal/Card/WhistleEnd/
-        // AdminCorrection) - without this, a club that transfers a player
-        // and then goes 7+ real days quiet would get pulled by
-        // apply_stale_club_reversion back toward its stale *pre-transfer*
-        // resting_value instead of the value the transfer itself produced.
         let (engine, seller, buyer) = engine_with_two_clubs();
         let event = TransferEvent {
             existing_player_id: None,

@@ -6,6 +6,7 @@ pub fn seed(engine: &mut ValuationEngine) {
     let mut club = ClubState::new(club_id);
     club.intrinsic_value = dec!(700.00); 
     
+    club.set_rival_factor(ClubId(2024), dec!(1.5)); // Deportivo La Coruna (Galician derby)
     engine.club_states.insert(club_id, club);
     engine.names.insert(club_id.0, "RC Celta".to_string());
 

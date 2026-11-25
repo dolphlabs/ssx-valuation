@@ -9,6 +9,7 @@ pub fn seed(engine: &mut ValuationEngine) {
     club.set_rival_factor(ClubId(5008), dec!(1.5)); // Marseille (Le Classique)
     club.set_rival_factor(ClubId(5002), dec!(1.3)); // Monaco
 
+    club.set_rival_factor(ClubId(5019), dec!(1.1)); // Paris FC (Paris derby)
     engine.club_states.insert(club_id, club);
     engine.names.insert(club_id.0, "Paris Saint-Germain".to_string());
 

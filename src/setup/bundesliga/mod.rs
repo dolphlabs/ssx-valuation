@@ -18,6 +18,11 @@ pub mod union_berlin;
 pub mod bochum;
 pub mod st_pauli;
 pub mod holstein_kiel;
+pub mod hamburg;
+pub mod koln;
+pub mod schalke;
+pub mod paderborn;
+pub mod elversberg;
 
 pub fn seed(engine: &mut ValuationEngine) {
     leverkusen::seed(engine);
@@ -38,4 +43,9 @@ pub fn seed(engine: &mut ValuationEngine) {
     bochum::seed(engine);
     st_pauli::seed(engine);
     holstein_kiel::seed(engine);
+    hamburg::seed(engine);
+    koln::seed(engine);
+    schalke::seed(engine);
+    paderborn::seed(engine);
+    elversberg::seed(engine);
 }

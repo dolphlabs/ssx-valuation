@@ -9,6 +9,7 @@ pub fn seed(engine: &mut ValuationEngine) {
     club.set_rival_factor(ClubId(4002), dec!(1.5)); // Bayern Munich (Der Klassiker)
     club.set_rival_factor(ClubId(4012), dec!(1.2)); // Wolfsburg? let's use Schalke if they were in BL, but they aren't.
 
+    club.set_rival_factor(ClubId(4021), dec!(1.5)); // FC Schalke 04 (Revierderby)
     engine.club_states.insert(club_id, club);
     engine.names.insert(club_id.0, "Borussia Dortmund".to_string());
 

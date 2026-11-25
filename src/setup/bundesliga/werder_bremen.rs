@@ -6,6 +6,7 @@ pub fn seed(engine: &mut ValuationEngine) {
     let mut club = ClubState::new(club_id);
     club.intrinsic_value = dec!(596.11); 
     
+    club.set_rival_factor(ClubId(4019), dec!(1.3)); // Hamburger SV (Nordderby)
     engine.club_states.insert(club_id, club);
     engine.names.insert(club_id.0, "Werder Bremen".to_string());
 

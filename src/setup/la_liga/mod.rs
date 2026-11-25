@@ -20,6 +20,11 @@ pub mod rayo_vallecano;
 pub mod leganes;
 pub mod real_valladolid;
 pub mod espanyol;
+pub mod levante;
+pub mod elche;
+pub mod malaga;
+pub mod deportivo;
+pub mod racing_santander;
 
 pub fn seed(engine: &mut ValuationEngine) {
     real_madrid::seed(engine);
@@ -42,4 +47,9 @@ pub fn seed(engine: &mut ValuationEngine) {
     leganes::seed(engine);
     real_valladolid::seed(engine);
     espanyol::seed(engine);
+    levante::seed(engine);
+    elche::seed(engine);
+    malaga::seed(engine);
+    deportivo::seed(engine);
+    racing_santander::seed(engine);
 }

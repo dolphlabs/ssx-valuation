@@ -6,6 +6,7 @@ pub fn seed(engine: &mut ValuationEngine) {
     let mut club = ClubState::new(club_id);
     club.intrinsic_value = dec!(862.94); 
     
+    club.set_rival_factor(ClubId(5020), dec!(1.2)); // FC Lorient (Breton derby)
     engine.club_states.insert(club_id, club);
     engine.names.insert(club_id.0, "Stade Rennais FC".to_string());
 

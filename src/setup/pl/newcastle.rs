@@ -12,6 +12,7 @@ pub fn seed(engine: &mut ValuationEngine) {
     club.set_rival_factor(ClubId(1), dec!(1.2)); // Man City
     club.set_rival_factor(ClubId(5), dec!(1.2)); // Liverpool
 
+    club.set_rival_factor(ClubId(22), dec!(1.5)); // Sunderland (Tyne-Wear derby)
     engine.club_states.insert(club_id, club);
 
     // Players

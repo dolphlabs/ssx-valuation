@@ -83,6 +83,10 @@ mod tests {
             player_ids: vec![],
             disciplinary_impact_this_match: dec!(0.0),
             red_cards_this_match: vec![],
+            noise_log: 0.0,
+            repricing_ln_remaining: 0.0,
+            repricing_ticks_remaining: 0,
+            anchor_value: None,
         });
         engine.club_states.insert(club2, ClubState {
             id: club2,
@@ -94,6 +98,10 @@ mod tests {
             player_ids: vec![],
             disciplinary_impact_this_match: dec!(0.0),
             red_cards_this_match: vec![],
+            noise_log: 0.0,
+            repricing_ln_remaining: 0.0,
+            repricing_ticks_remaining: 0,
+            anchor_value: None,
         });
 
         let events = vec![

@@ -6,6 +6,7 @@ pub fn seed(engine: &mut ValuationEngine) {
     let mut club = ClubState::new(club_id);
     club.intrinsic_value = dec!(692.28); 
     
+    club.set_rival_factor(ClubId(4020), dec!(1.3)); // 1. FC Koln (Rhine derby)
     engine.club_states.insert(club_id, club);
     engine.names.insert(club_id.0, "Borussia Monchengladbach".to_string());
 

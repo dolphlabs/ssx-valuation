@@ -8,6 +8,7 @@ pub fn seed(engine: &mut ValuationEngine) {
     
     club.set_rival_factor(ClubId(2008), dec!(1.2)); // Villarreal (Derbi de la Comunitat)
 
+    club.set_rival_factor(ClubId(2021), dec!(1.3)); // Levante UD (Valencia derby)
     engine.club_states.insert(club_id, club);
     engine.names.insert(club_id.0, "Valencia CF".to_string());
 

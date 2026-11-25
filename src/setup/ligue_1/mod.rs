@@ -18,6 +18,10 @@ pub mod le_havre;
 pub mod auxerre;
 pub mod angers;
 pub mod saint_etienne;
+pub mod paris_fc;
+pub mod lorient;
+pub mod troyes;
+pub mod le_mans;
 
 pub fn seed(engine: &mut ValuationEngine) {
     psg::seed(engine);
@@ -38,4 +42,8 @@ pub fn seed(engine: &mut ValuationEngine) {
     auxerre::seed(engine);
     angers::seed(engine);
     saint_etienne::seed(engine);
+    paris_fc::seed(engine);
+    lorient::seed(engine);
+    troyes::seed(engine);
+    le_mans::seed(engine);
 }
