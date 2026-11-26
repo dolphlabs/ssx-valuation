@@ -87,6 +87,8 @@ mod tests {
             repricing_ln_remaining: 0.0,
             repricing_ticks_remaining: 0,
             anchor_value: None,
+            transfer_ln: 0.0,
+            conceded_this_match: 0,
         });
         engine.club_states.insert(club2, ClubState {
             id: club2,
@@ -102,6 +104,8 @@ mod tests {
             repricing_ln_remaining: 0.0,
             repricing_ticks_remaining: 0,
             anchor_value: None,
+            transfer_ln: 0.0,
+            conceded_this_match: 0,
         });
 
         let events = vec![

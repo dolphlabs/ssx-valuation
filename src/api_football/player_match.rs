@@ -101,6 +101,8 @@ mod tests {
                     position: Position::CM,
                     is_captain: false,
                     active: true,
+                    seed_value: None,
+                    injury_ln: 0.0,
                 },
             );
         }

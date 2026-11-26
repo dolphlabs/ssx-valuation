@@ -14,6 +14,8 @@ pub mod env_config;
 pub mod trading;
 pub mod api_football;
 pub mod transfers;
+pub mod transfer_impact;
+pub mod ratings;
 pub mod live_match;
 pub mod injuries;
 pub mod admin_correction;
@@ -56,6 +58,11 @@ pub fn is_transfer_window_open(month: u32, day: u32) -> bool {
 fn heartbeat_multiplier(shock: f64) -> Decimal {
     Decimal::from_f64_retain(shock.exp()).unwrap_or(dec!(1.0))
 }
+
+/// The lowest any club can be worth. Nearly every move is a percentage, so
+/// a club only approaches zero; this is the backstop for anything that
+/// isn't (and keeps the heartbeat's and fade's logarithms defined).
+pub const MIN_CLUB_VALUE: Decimal = dec!(1);
 
 /// Ceiling on `HEARTBEAT_NOISE_BAND` - a typo guard (`3` for `0.03`), not a
 /// product limit.
@@ -116,17 +123,55 @@ impl HeartbeatNoise {
 pub struct ResultFade {
     /// Share of the log distance from the anchor each tick keeps.
     pub keep: f64,
+    /// Share of the transfer move (`ClubState::transfer_ln`) each tick
+    /// keeps. Transfers fade on their own, slower clock - a squad change
+    /// lasts longer than a goal - so ~10% is left after 9 months.
+    #[serde(default = "keep_all")]
+    pub transfer_keep: f64,
+}
+
+fn keep_all() -> f64 {
+    1.0
+}
+
+fn keep_per_tick(half_life_secs: f64, interval_secs: f64) -> f64 {
+    if half_life_secs > 0.0 && interval_secs > 0.0 { 0.5f64.powf(interval_secs / half_life_secs) } else { 1.0 }
 }
 
 impl ResultFade {
-    pub const NONE: Self = Self { keep: 1.0 };
+    pub const NONE: Self = Self { keep: 1.0, transfer_keep: 1.0 };
 
     pub fn calibrate(half_life_secs: f64, interval_secs: f64) -> Self {
-        if half_life_secs > 0.0 && interval_secs > 0.0 {
-            Self { keep: 0.5f64.powf(interval_secs / half_life_secs) }
-        } else {
-            Self::NONE
-        }
+        Self { keep: keep_per_tick(half_life_secs, interval_secs), transfer_keep: 1.0 }
+    }
+
+    /// Adds the transfer clock: `half_life_secs` for a transfer move to halve.
+    pub fn with_transfer_half_life(self, half_life_secs: f64, interval_secs: f64) -> Self {
+        Self { transfer_keep: keep_per_tick(half_life_secs, interval_secs), ..self }
+    }
+}
+
+/// Default transfer half-life: 81 days leaves ~10% of a move after 9 months.
+pub const TRANSFER_HALF_LIFE_DAYS: f64 = 81.0;
+
+/// The player-rating counterpart of `ResultFade`, applied hourly: ratings
+/// fade toward each player's seed like clubs fade toward theirs, so goals
+/// can't compound a rating without limit, and injury hits heal on their own
+/// faster clock.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlayerFade {
+    pub keep: f64,
+    pub injury_keep: f64,
+}
+
+/// Days for an injury hit on a rating to heal halfway.
+pub const INJURY_HALF_LIFE_DAYS: f64 = 14.0;
+
+impl PlayerFade {
+    pub const NONE: Self = Self { keep: 1.0, injury_keep: 1.0 };
+
+    pub fn calibrate(half_life_secs: f64, injury_half_life_secs: f64, interval_secs: f64) -> Self {
+        Self { keep: keep_per_tick(half_life_secs, interval_secs), injury_keep: keep_per_tick(injury_half_life_secs, interval_secs) }
     }
 }
 
@@ -134,6 +179,12 @@ impl ResultFade {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 pub struct ClubId(pub u32);
+
+/// The side of a match we don't track (a European opponent, a club outside
+/// the roster). Never in `club_states`, so the engine skips its half of
+/// every event and only the tracked club moves - a goal it concedes, a
+/// card against the opponent.
+pub const UNTRACKED_CLUB: ClubId = ClubId(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 pub struct PlayerId(pub u32);
@@ -221,6 +272,15 @@ pub struct PlayerValues {
     /// players (see `process_event`), so a departed player's value simply
     /// freezes at whatever it was when they left.
     pub active: bool,
+    /// What the rating fades back toward (`PlayerFade`): the seed (last
+    /// season's rating), or the value a transfer signing arrived at. `None`
+    /// means no fading.
+    #[serde(default)]
+    pub seed_value: Option<Decimal>,
+    /// The log hit of the player's current injury, healing on its own clock.
+    /// A new report only deepens it to the worse of the two; it never stacks.
+    #[serde(default)]
+    pub injury_ln: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -270,6 +330,15 @@ pub struct ClubState {
     pub anchor_value: Option<Decimal>,
     #[serde(default)]
     pub repricing_ticks_remaining: u32,
+    /// The log move transfers have made and that hasn't faded yet. Results
+    /// fade toward `anchor * e^transfer_ln`, and this fades on its own
+    /// clock (`ResultFade::transfer_keep`), so a transfer outlasts a goal.
+    #[serde(default)]
+    pub transfer_ln: f64,
+    /// Goals conceded in the match in progress; zero at full time is a clean
+    /// sheet for the keeper and the back four. Reset at every `WhistleEnd`.
+    #[serde(default)]
+    pub conceded_this_match: u32,
 }
 
 /// One applied red card, as `RedCardCancelled` needs it: the signed,
@@ -298,6 +367,8 @@ impl ClubState {
             repricing_ln_remaining: 0.0,
             repricing_ticks_remaining: 0,
             anchor_value: None,
+            transfer_ln: 0.0,
+            conceded_this_match: 0,
         }
     }
 
@@ -310,13 +381,17 @@ impl ClubState {
     pub fn apply_fade(&mut self, fade: ResultFade) {
         use rust_decimal::prelude::ToPrimitive;
         let Some(anchor) = self.anchor_value.filter(|a| *a > Decimal::ZERO) else { return };
-        if fade.keep >= 1.0 {
+        if fade.keep >= 1.0 && (fade.transfer_keep >= 1.0 || self.transfer_ln == 0.0) {
             return;
         }
         let Some(ratio) = (self.fundamental_value() / anchor).to_f64().filter(|r| *r > 0.0) else { return };
-        let offset = ratio.ln();
-        let factor = heartbeat_multiplier(offset * (fade.keep - 1.0));
+        // Results fade toward the anchor as transfers have moved it...
+        let offset = ratio.ln() - self.transfer_ln;
+        // ...and the transfer move itself fades on its own clock.
+        let transfer_next = self.transfer_ln * fade.transfer_keep;
+        let factor = heartbeat_multiplier(offset * (fade.keep - 1.0) + (transfer_next - self.transfer_ln));
         self.intrinsic_value *= factor;
+        self.transfer_ln = transfer_next;
     }
 
     fn step_repricing(&mut self) {
@@ -329,6 +404,15 @@ impl ClubState {
         self.repricing_ticks_remaining -= 1;
         self.repricing_ln_remaining = if self.repricing_ticks_remaining == 0 { 0.0 } else { self.repricing_ln_remaining - step };
         self.anchor_resting_value();
+    }
+
+    /// Lifts the club back to `MIN_CLUB_VALUE` if a move took it below,
+    /// re-anchoring `resting_value` so it never records a sub-floor value.
+    pub(crate) fn enforce_floor(&mut self) {
+        if self.intrinsic_value < MIN_CLUB_VALUE {
+            self.intrinsic_value = MIN_CLUB_VALUE;
+            self.anchor_resting_value();
+        }
     }
 
     /// What events alone make the club worth, with the heartbeat's noise taken out.
@@ -360,6 +444,13 @@ impl ClubState {
 /// meter, via ssx-executor) quote the engine's own magnitude instead of a
 /// hand-copied number that could drift from it.
 pub const GOAL_BASE_IMPACT_PCT: Decimal = dec!(0.025);
+/// A goal's move on the scorer's own rating, before position, form and
+/// rivalry: about what a goal moves a club. It was 0.15, which compounded a
+/// 30-goal striker to dozens of times his seed.
+pub const PLAYER_GOAL_IMPACT_PCT: Decimal = dec!(0.05);
+/// A clean sheet's lift on the keeper and on each of the back four.
+pub const CLEAN_SHEET_GK_PCT: f64 = 0.03;
+pub const CLEAN_SHEET_DEF_PCT: f64 = 0.02;
 pub const GOAL_LATE_IMPACT_PCT: Decimal = dec!(0.05);
 
 /// One club's move for a goal at the average minute (45') with a neutral
@@ -439,6 +530,13 @@ impl ValuationEngine {
         self.notify(EngineUpdate::MatchEventApplied(event));
     }
 
+    /// Every change to a club's value goes out through here, so the floor
+    /// is applied in one place.
+    pub(crate) fn publish_club(&self, club: &mut ClubState, ts: u64) {
+        club.enforce_floor();
+        self.notify(EngineUpdate::Club { id: club.id, state: club.clone(), ts });
+    }
+
     fn notify(&self, update: EngineUpdate) {
         if let Some(tx) = &self.update_tx {
             let _ = tx.send(update);
@@ -454,6 +552,79 @@ impl ValuationEngine {
     pub fn apply_result_fade(&self, fade: ResultFade) {
         for mut club in self.club_states.iter_mut() {
             club.apply_fade(fade);
+            club.enforce_floor();
+        }
+    }
+
+    /// Fades every active player's rating toward its seed and heals injury
+    /// hits (`PlayerFade`). With `publish`, each changed player goes out as
+    /// an update (live); the replay leaves it off. Returns how many moved.
+    pub fn apply_player_fade(&self, fade: PlayerFade, publish: bool) -> usize {
+        use rust_decimal::prelude::ToPrimitive;
+        let mut moved = Vec::new();
+        let mut count = 0;
+        for mut entry in self.player_states.iter_mut() {
+            let id = *entry.key();
+            let player = entry.value_mut();
+            if !player.active || player.intrinsic_value <= Decimal::ZERO {
+                continue;
+            }
+            let injury_next = player.injury_ln * fade.injury_keep;
+            let mut ln_step = injury_next - player.injury_ln;
+            if let Some(ratio) = player.seed_value.filter(|s| *s > Decimal::ZERO).and_then(|seed| (player.intrinsic_value / seed).to_f64()).filter(|r| *r > 0.0) {
+                // Fade the form part only - the injury heals on its own clock.
+                ln_step += (ratio.ln() - player.injury_ln) * (fade.keep - 1.0);
+            }
+            if ln_step == 0.0 {
+                continue;
+            }
+            player.intrinsic_value *= heartbeat_multiplier(ln_step);
+            player.injury_ln = injury_next;
+            count += 1;
+            if publish {
+                moved.push((id, player.clone()));
+            }
+        }
+        // Sent after the iteration, so no shard lock is held while notifying.
+        for (id, state) in moved {
+            self.notify(EngineUpdate::Player { id, state });
+        }
+        count
+    }
+
+    /// Sets a player's rating outright - the season replay's repair. Clears
+    /// the injury hit and the history it was built on. False if unknown.
+    pub fn reset_player_rating(&self, id: PlayerId, rating: Decimal) -> bool {
+        let Some(mut player) = self.player_states.get_mut(&id) else { return false };
+        player.intrinsic_value = rating.max(Decimal::ZERO);
+        player.injury_ln = 0.0;
+        player.performance_history = vec![player.intrinsic_value];
+        let state = player.clone();
+        drop(player);
+        self.notify(EngineUpdate::Player { id, state });
+        true
+    }
+
+    /// Lifts the keeper and the back four (the best-rated active players in
+    /// each line - we don't have lineups) after a match without conceding.
+    fn reward_clean_sheet(&self, team_id: ClubId) {
+        let mut keepers: Vec<(PlayerId, Decimal)> = Vec::new();
+        let mut defenders: Vec<(PlayerId, Decimal)> = Vec::new();
+        for entry in self.player_states.iter().filter(|e| e.value().active && e.value().team_id == team_id) {
+            match transfer_impact::line(entry.value().position) {
+                0 => keepers.push((*entry.key(), entry.value().intrinsic_value)),
+                1 => defenders.push((*entry.key(), entry.value().intrinsic_value)),
+                _ => {}
+            }
+        }
+        keepers.sort_by(|a, b| b.1.cmp(&a.1));
+        defenders.sort_by(|a, b| b.1.cmp(&a.1));
+        let lifts = keepers.iter().take(1).map(|(id, _)| (*id, CLEAN_SHEET_GK_PCT)).chain(defenders.iter().take(4).map(|(id, _)| (*id, CLEAN_SHEET_DEF_PCT)));
+        for (id, pct) in lifts.collect::<Vec<_>>() {
+            if let Some(mut player) = self.player_states.get_mut(&id) {
+                player.intrinsic_value *= heartbeat_multiplier((1.0 + pct).ln());
+                self.notify(EngineUpdate::Player { id, state: player.clone() });
+            }
         }
     }
 
@@ -554,7 +725,7 @@ impl ValuationEngine {
                 let reactor_delta_pct = -signed_delta_pct * SPILLOVER_DAMPING * weight;
                 let base_value = reactor.intrinsic_value;
                 reactor.intrinsic_value = scale(base_value, reactor_delta_pct, undo);
-                self.notify(EngineUpdate::Club { id: reactor_id, state: reactor.clone(), ts: current_ts });
+                self.publish_club(&mut reactor, current_ts);
             }
         }
     }
@@ -596,7 +767,7 @@ impl ValuationEngine {
             club.intrinsic_value = scale(base_value, scorer_impact_pct, undo);
             club.last_match_update = current_ts;
             club.anchor_resting_value();
-            self.notify(EngineUpdate::Club { id: team_id, state: club.clone(), ts: current_ts });
+            self.publish_club(&mut club, current_ts);
         }
         self.rivalry_spillover(team_id, opponent_id, scorer_impact_pct, current_ts, undo);
 
@@ -615,17 +786,18 @@ impl ValuationEngine {
         let mut conceder_impact_pct = Decimal::ZERO;
         if let Some(mut opponent_club) = self.club_states.get_mut(&opponent_id) {
             conceder_impact_pct = base_impact_pct * conceder_rivalry_multiplier;
+            opponent_club.conceded_this_match = if undo { opponent_club.conceded_this_match.saturating_sub(1) } else { opponent_club.conceded_this_match + 1 };
             let base_value = opponent_club.intrinsic_value;
             opponent_club.intrinsic_value = scale(base_value, -conceder_impact_pct, undo);
             opponent_club.last_match_update = current_ts;
             opponent_club.anchor_resting_value();
-            self.notify(EngineUpdate::Club { id: opponent_id, state: opponent_club.clone(), ts: current_ts });
+            self.publish_club(&mut opponent_club, current_ts);
         }
         self.rivalry_spillover(opponent_id, team_id, -conceder_impact_pct, current_ts, undo);
 
         if let Some(mut player) = self.player_states.get_mut(&player_id) {
             let pos_multiplier = player.position.base_weight();
-            let player_impact_pct = dec!(0.15) * pos_multiplier * player.form_weight * scorer_rivalry_multiplier;
+            let player_impact_pct = PLAYER_GOAL_IMPACT_PCT * pos_multiplier * player.form_weight * scorer_rivalry_multiplier;
             let base_value = player.intrinsic_value;
             player.intrinsic_value = scale(base_value, player_impact_pct, undo);
             self.notify(EngineUpdate::Player { id: player_id, state: player.clone() });
@@ -655,7 +827,7 @@ impl ValuationEngine {
                 club.disciplinary_impact_this_match -= pct;
                 club.last_match_update = current_ts;
                 club.anchor_resting_value();
-                self.notify(EngineUpdate::Club { id: club_id, state: club.clone(), ts: current_ts });
+                self.publish_club(&mut club, current_ts);
             }
         }
         self.rivalry_spillover(team_id, opponent_id, card.carded_pct, current_ts, true);
@@ -692,7 +864,7 @@ impl ValuationEngine {
                     club.intrinsic_value += base_value * carded_impact_pct;
                     club.last_match_update = current_ts;
                     club.anchor_resting_value();
-                    self.notify(EngineUpdate::Club { id: team_id, state: club.clone(), ts: current_ts });
+                    self.publish_club(&mut club, current_ts);
                 }
                 self.apply_rivalry_spillover(team_id, opponent_id, carded_impact_pct, current_ts);
 
@@ -714,7 +886,7 @@ impl ValuationEngine {
                     opponent_club.intrinsic_value += base_value * benefiting_impact_pct;
                     opponent_club.last_match_update = current_ts;
                     opponent_club.anchor_resting_value();
-                    self.notify(EngineUpdate::Club { id: opponent_id, state: opponent_club.clone(), ts: current_ts });
+                    self.publish_club(&mut opponent_club, current_ts);
                 }
                 self.apply_rivalry_spillover(opponent_id, team_id, benefiting_impact_pct, current_ts);
 
@@ -748,7 +920,7 @@ impl ValuationEngine {
                     club.intrinsic_value += base_value * carded_impact_pct;
                     club.last_match_update = current_ts;
                     club.anchor_resting_value();
-                    self.notify(EngineUpdate::Club { id: team_id, state: club.clone(), ts: current_ts });
+                    self.publish_club(&mut club, current_ts);
                 }
                 self.apply_rivalry_spillover(team_id, opponent_id, carded_impact_pct, current_ts);
 
@@ -763,7 +935,7 @@ impl ValuationEngine {
                     opponent_club.intrinsic_value += base_value * benefiting_impact_pct;
                     opponent_club.last_match_update = current_ts;
                     opponent_club.anchor_resting_value();
-                    self.notify(EngineUpdate::Club { id: opponent_id, state: opponent_club.clone(), ts: current_ts });
+                    self.publish_club(&mut opponent_club, current_ts);
                 }
                 self.apply_rivalry_spillover(opponent_id, team_id, benefiting_impact_pct, current_ts);
 
@@ -774,14 +946,22 @@ impl ValuationEngine {
             }
             MatchEvent::Injury { player_id, severity } => {
                 if let Some(mut player) = self.player_states.get_mut(&player_id) {
-                    let loss = player.intrinsic_value * (Decimal::from(severity) / dec!(100.0));
-                    player.intrinsic_value -= loss;
-                    self.notify(EngineUpdate::Player { id: player_id, state: player.clone() });
+                    // Deepens the current injury to the worse of the two -
+                    // the same injury reported again, or reworded, doesn't
+                    // stack - and it heals on `PlayerFade::injury_keep`.
+                    let hit = (1.0 - f64::from(severity.min(95)) / 100.0).ln();
+                    if hit < player.injury_ln {
+                        let step = heartbeat_multiplier(hit - player.injury_ln);
+                        player.intrinsic_value *= step;
+                        player.injury_ln = hit;
+                        self.notify(EngineUpdate::Player { id: player_id, state: player.clone() });
+                    }
                 }
             }
             MatchEvent::WhistleEnd { team_a_id, team_b_id } => {
                 let is_window = self.is_transfer_window.load(std::sync::atomic::Ordering::Relaxed);
                 for &team_id in &[team_a_id, team_b_id] {
+                    let mut clean_sheet = false;
                     if let Some(mut club) = self.club_states.get_mut(&team_id) {
                         club.last_match_update = current_ts;
                         club.anchor_resting_value();
@@ -789,7 +969,12 @@ impl ValuationEngine {
                         // see MAX_DISCIPLINARY_IMPACT_PCT_PER_MATCH.
                         club.disciplinary_impact_this_match = Decimal::ZERO;
                         club.red_cards_this_match.clear();
-                        self.notify(EngineUpdate::Club { id: team_id, state: club.clone(), ts: current_ts });
+                        clean_sheet = club.conceded_this_match == 0;
+                        club.conceded_this_match = 0;
+                        self.publish_club(&mut club, current_ts);
+                    }
+                    if clean_sheet {
+                        self.reward_clean_sheet(team_id);
                     }
                     
                         let pids: Vec<PlayerId> = self.player_states.iter()
@@ -814,13 +999,19 @@ impl ValuationEngine {
                             let form_multiplier = dec!(1.0) + (player.form_weight - dec!(1.0)) * form_sensitivity;
                             let v = player.intrinsic_value * form_multiplier * player.sentiment_score;
 
-                            player.performance_history.push(v);
+                            // A tenth of the way toward `v` each match, as a
+                            // multiplier - what averaging the last 10 values
+                            // gave on a steady history, without averaging back
+                            // in old values and undoing fades and recoveries.
+                            if !player.intrinsic_value.is_zero() {
+                                let step = Decimal::ONE + (v / player.intrinsic_value - Decimal::ONE) / dec!(10);
+                                player.intrinsic_value *= step;
+                            }
+                            let current = player.intrinsic_value;
+                            player.performance_history.push(current);
                             if player.performance_history.len() > 10 {
                                 player.performance_history.remove(0);
                             }
-
-                            let sum: Decimal = player.performance_history.iter().sum();
-                            player.intrinsic_value = sum / Decimal::from(player.performance_history.len());
                             self.notify(EngineUpdate::Player { id: pid, state: player.clone() });
                         }
                     }
@@ -849,7 +1040,7 @@ impl ValuationEngine {
                     club.noise_log = next;
                     club.step_repricing();
 
-                    self.notify(EngineUpdate::Club { id: team_id, state: club.clone(), ts: current_ts });
+                    self.publish_club(&mut club, current_ts);
                 }
             }
             MatchEvent::Repricing { team_id, ln_delta, ticks } => {
@@ -863,7 +1054,7 @@ impl ValuationEngine {
                     }
                     club.last_match_update = current_ts;
                     club.anchor_resting_value();
-                    self.notify(EngineUpdate::Club { id: team_id, state: club.clone(), ts: current_ts });
+                    self.publish_club(&mut club, current_ts);
                 }
             }
             MatchEvent::AdminCorrection { team_id, delta_pct } => {
@@ -871,7 +1062,7 @@ impl ValuationEngine {
                     club.intrinsic_value *= dec!(1.0) + delta_pct / dec!(100.0);
                     club.last_match_update = current_ts;
                     club.anchor_resting_value();
-                    self.notify(EngineUpdate::Club { id: team_id, state: club.clone(), ts: current_ts });
+                    self.publish_club(&mut club, current_ts);
                 }
             }
         }
@@ -1039,6 +1230,8 @@ mod event_impact_tests {
                     position: Position::CM,
                     is_captain: false,
                     active: true,
+                    seed_value: None,
+                    injury_ln: 0.0,
                 },
             );
         }
@@ -1459,6 +1652,8 @@ mod whistle_end_tests {
                 position: Position::CM,
                 is_captain: false,
                 active: true,
+                seed_value: None,
+                injury_ln: 0.0,
             },
         );
         (engine, club_id, player_id)
@@ -1569,6 +1764,27 @@ mod heartbeat_noise_tests {
         club.resting_value = Some(value);
         engine.club_states.insert(id, club);
         (engine, id)
+    }
+
+    #[test]
+    fn no_club_drops_below_the_floor() {
+        // A club already scraping the floor that keeps conceding late goals
+        // and getting sent off stays at MIN_CLUB_VALUE, with resting_value
+        // anchored there too.
+        let (engine, id) = engine_with_club(dec!(1.02));
+        for _ in 0..20 {
+            engine.process_event(MatchEvent::Goal { team_id: UNTRACKED_CLUB, opponent_id: id, player_id: PlayerId(0), minute: 90 }, 0);
+            engine.process_event(MatchEvent::RedCard { team_id: id, opponent_id: UNTRACKED_CLUB, player_id: PlayerId(0) }, 0);
+        }
+        let club = engine.club_states.get(&id).unwrap();
+        assert_eq!(club.intrinsic_value, MIN_CLUB_VALUE);
+        assert_eq!(club.resting_value, Some(MIN_CLUB_VALUE));
+        drop(club);
+
+        // An admin cut of -99.9% hits the floor rather than 0.001.
+        let (engine, id) = engine_with_club(dec!(50));
+        engine.process_event(MatchEvent::AdminCorrection { team_id: id, delta_pct: dec!(-99.9) }, 0);
+        assert_eq!(engine.club_states.get(&id).unwrap().intrinsic_value, MIN_CLUB_VALUE);
     }
 
     fn tick(engine: &ValuationEngine, id: ClubId, noise: HeartbeatNoise, n: usize) {
@@ -1718,7 +1934,7 @@ mod heartbeat_noise_tests {
     #[test]
     fn a_club_below_its_anchor_fades_back_up_the_same_way() {
         let (engine, id) = anchored(dec!(250), dec!(1000));
-        engine.apply_result_fade(ResultFade { keep: 0.5 });
+        engine.apply_result_fade(ResultFade { keep: 0.5, ..ResultFade::NONE });
         let got = engine.club_states.get(&id).unwrap().fundamental_value();
         assert!((got - dec!(500)).abs() < dec!(0.001), "got {got}");
     }
@@ -1731,7 +1947,7 @@ mod heartbeat_noise_tests {
             club.noise_log = 0.04;
             club.intrinsic_value = dec!(4000) * heartbeat_multiplier(0.04);
         }
-        engine.apply_result_fade(ResultFade { keep: 0.5 });
+        engine.apply_result_fade(ResultFade { keep: 0.5, ..ResultFade::NONE });
         let club = engine.club_states.get(&id).unwrap();
         assert_eq!(club.noise_log, 0.04);
         assert!((club.fundamental_value() - dec!(2000)).abs() < dec!(0.001), "got {}", club.fundamental_value());
@@ -1752,7 +1968,7 @@ mod heartbeat_noise_tests {
         for id in [1, 2] {
             engine.process_event(MatchEvent::Goal { team_id: ClubId(id), opponent_id: ClubId(9), player_id: PlayerId(0), minute: 45 }, 0);
         }
-        engine.apply_result_fade(ResultFade { keep: 0.9 });
+        engine.apply_result_fade(ResultFade { keep: 0.9, ..ResultFade::NONE });
         let gain = |id: u32, b: Decimal| {
             use rust_decimal::prelude::ToPrimitive;
             let anchor = 1000.0;
@@ -1765,8 +1981,18 @@ mod heartbeat_noise_tests {
     #[test]
     fn a_club_without_an_anchor_never_fades() {
         let (engine, id) = engine_with_club(dec!(4000));
-        engine.apply_result_fade(ResultFade { keep: 0.5 });
+        engine.apply_result_fade(ResultFade { keep: 0.5, ..ResultFade::NONE });
         assert_eq!(engine.club_states.get(&id).unwrap().intrinsic_value, dec!(4000));
+    }
+
+    #[test]
+    fn a_goal_against_an_untracked_club_moves_only_the_tracked_one() {
+        let (engine, id) = engine_with_club(dec!(1000));
+        engine.process_event(MatchEvent::Goal { team_id: UNTRACKED_CLUB, opponent_id: id, player_id: PlayerId(0), minute: 0 }, 0);
+        engine.process_event(MatchEvent::WhistleEnd { team_a_id: id, team_b_id: UNTRACKED_CLUB }, 1);
+        let got = engine.club_states.get(&id).unwrap().fundamental_value();
+        assert_eq!(got, dec!(1000) * (Decimal::ONE - GOAL_BASE_IMPACT_PCT));
+        assert!(!engine.club_states.contains_key(&UNTRACKED_CLUB));
     }
 
     #[test]
@@ -1899,5 +2125,115 @@ mod transfer_window_tests {
     #[test]
     fn window_opens_on_june_first() {
         assert!(is_transfer_window_open(6, 1));
+    }
+}
+#[cfg(test)]
+mod player_rating_tests {
+    use super::*;
+
+    fn engine_with(players: &[(u32, Position, Decimal)]) -> ValuationEngine {
+        let engine = ValuationEngine::new();
+        for id in [1, 2] {
+            engine.club_states.insert(ClubId(id), ClubState::new(ClubId(id)));
+        }
+        for &(id, position, value) in players {
+            engine.player_states.insert(
+                PlayerId(id),
+                PlayerValues {
+                    team_id: ClubId(1),
+                    intrinsic_value: value,
+                    form_weight: dec!(1.0),
+                    sentiment_score: dec!(1.0),
+                    volatility_factor: dec!(1.0),
+                    performance_history: vec![value],
+                    position,
+                    is_captain: false,
+                    active: true,
+                    seed_value: Some(value),
+                    injury_ln: 0.0,
+                },
+            );
+        }
+        engine
+    }
+
+    fn rating(engine: &ValuationEngine, id: u32) -> f64 {
+        use rust_decimal::prelude::ToPrimitive;
+        engine.player_states.get(&PlayerId(id)).unwrap().intrinsic_value.to_f64().unwrap()
+    }
+
+    #[test]
+    fn a_goal_lifts_the_scorer_about_five_percent() {
+        let engine = engine_with(&[(9, Position::ST, dec!(100))]);
+        engine.process_event(MatchEvent::Goal { team_id: ClubId(1), opponent_id: ClubId(2), player_id: PlayerId(9), minute: 30 }, 0);
+        let r = rating(&engine, 9);
+        assert!(r > 104.0 && r < 105.0, "{r}");
+    }
+
+    #[test]
+    fn ratings_fade_back_to_the_seed_so_goals_cant_compound_forever() {
+        let engine = engine_with(&[(9, Position::ST, dec!(100))]);
+        for _ in 0..20 {
+            engine.process_event(MatchEvent::Goal { team_id: ClubId(1), opponent_id: ClubId(2), player_id: PlayerId(9), minute: 30 }, 0);
+        }
+        let hot = rating(&engine, 9);
+        engine.apply_player_fade(PlayerFade { keep: 0.5, injury_keep: 1.0 }, false);
+        let faded = rating(&engine, 9);
+        assert!(((faded / 100.0).ln() - (hot / 100.0).ln() / 2.0).abs() < 1e-9, "half the log distance to the seed is left");
+    }
+
+    #[test]
+    fn an_injury_doesnt_stack_and_heals() {
+        let engine = engine_with(&[(4, Position::CB, dec!(100))]);
+        engine.process_event(MatchEvent::Injury { player_id: PlayerId(4), severity: 25 }, 0);
+        assert!((rating(&engine, 4) - 75.0).abs() < 1e-6);
+        // Reported again, or as something milder: no further hit.
+        engine.process_event(MatchEvent::Injury { player_id: PlayerId(4), severity: 25 }, 0);
+        engine.process_event(MatchEvent::Injury { player_id: PlayerId(4), severity: 10 }, 0);
+        assert!((rating(&engine, 4) - 75.0).abs() < 1e-6);
+        // Worse news deepens it to the worse level, not on top.
+        engine.process_event(MatchEvent::Injury { player_id: PlayerId(4), severity: 50 }, 0);
+        assert!((rating(&engine, 4) - 50.0).abs() < 1e-6);
+        // Fully healed, back at the seed.
+        engine.apply_player_fade(PlayerFade { keep: 1.0, injury_keep: 0.0 }, false);
+        assert!((rating(&engine, 4) - 100.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_clean_sheet_lifts_the_keeper_and_back_four_only() {
+        let mut squad: Vec<(u32, Position, Decimal)> = vec![(1, Position::GK, dec!(50)), (2, Position::GK, dec!(20)), (9, Position::ST, dec!(80))];
+        squad.extend((10..15).map(|i| (i, Position::CB, Decimal::from(40 - i))));
+        let engine = engine_with(&squad);
+        engine.process_event(MatchEvent::WhistleEnd { team_a_id: ClubId(1), team_b_id: ClubId(2) }, 0);
+        assert!((rating(&engine, 1) - 51.5).abs() < 1e-6, "keeper +3%");
+        assert!((rating(&engine, 2) - 20.0).abs() < 1e-6, "backup keeper untouched");
+        assert!((rating(&engine, 10) - 30.0 * 1.02).abs() < 1e-6, "best defender +2%");
+        assert!((rating(&engine, 14) - 26.0).abs() < 1e-6, "fifth defender untouched");
+        assert!((rating(&engine, 9) - 80.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn conceding_means_no_clean_sheet_and_var_gives_it_back() {
+        let engine = engine_with(&[(1, Position::GK, dec!(50))]);
+        let goal = MatchEvent::Goal { team_id: ClubId(2), opponent_id: ClubId(1), player_id: PlayerId(0), minute: 10 };
+        engine.process_event(goal, 0);
+        engine.process_event(MatchEvent::WhistleEnd { team_a_id: ClubId(1), team_b_id: ClubId(2) }, 0);
+        assert!((rating(&engine, 1) - 50.0).abs() < 1e-6);
+
+        engine.process_event(MatchEvent::Goal { team_id: ClubId(2), opponent_id: ClubId(1), player_id: PlayerId(0), minute: 10 }, 0);
+        engine.process_event(MatchEvent::GoalCancelled { team_id: ClubId(2), opponent_id: ClubId(1), player_id: PlayerId(0), minute: 10 }, 0);
+        engine.process_event(MatchEvent::WhistleEnd { team_a_id: ClubId(1), team_b_id: ClubId(2) }, 0);
+        assert!((rating(&engine, 1) - 51.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn full_time_nudges_by_form_instead_of_averaging_old_values_back_in() {
+        let engine = engine_with(&[(9, Position::ST, dec!(100))]);
+        engine.player_states.get_mut(&PlayerId(9)).unwrap().performance_history = vec![dec!(10); 9];
+        engine.player_states.get_mut(&PlayerId(9)).unwrap().form_weight = dec!(1.2);
+        engine.club_states.get_mut(&ClubId(1)).unwrap().conceded_this_match = 1;
+        engine.process_event(MatchEvent::WhistleEnd { team_a_id: ClubId(1), team_b_id: ClubId(2) }, 0);
+        // form multiplier 1 + 0.2*0.5 = 1.1; a tenth of the way: +1%.
+        assert!((rating(&engine, 9) - 101.0).abs() < 1e-6, "{}", rating(&engine, 9));
     }
 }

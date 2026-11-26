@@ -26,6 +26,14 @@ commits that fixed them - is what actually shipped.
   anchor (last season's value), halving its distance every 60 days by default, so
   recent form counts most and every goal is worth the same to every club at the same
   point in time.
+- **Transfers by squad strength** (`src/transfer_impact.rs`) - a transfer moves each
+  club by the change in its best XI and bench, plus a smaller business term for how
+  far the fee sat from the player's rating. Losing your best player hurts far more in a
+  thin squad than a deep one. Each side is capped at ±25% per transfer, loans count for
+  less, and the move fades over the season (81-day half-life). No club can fall below 1.
+- **Player ratings** (`src/ratings.rs`) - ratings drift back to their seed, injuries
+  heal (14-day half-life) instead of stacking, clean sheets lift keepers and defenders,
+  and ratings are shown on a 0-100 scale per position line, to one decimal place.
 - **The vAMM** (`src/trading/vamm.rs`) - constant-product (`x·y=k`) liquidity for every
   club pair, with periodic repeg toward the index price.
 - **Risk math** (`src/trading/risk.rs`) - maintenance margin, liquidation triggers.

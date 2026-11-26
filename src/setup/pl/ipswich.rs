@@ -47,6 +47,8 @@ pub fn seed(engine: &mut ValuationEngine) {
             position: pos,
             is_captain: captain,
             active: true,
+            seed_value: Some(val),
+            injury_ln: 0.0,
         });
     }
 }

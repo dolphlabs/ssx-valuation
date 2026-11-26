@@ -48,6 +48,8 @@ pub fn seed(engine: &mut ValuationEngine) {
             position: pos,
             is_captain: captain,
             active: true,
+            seed_value: Some(val),
+            injury_ln: 0.0,
         });
         engine.names.insert(id, name.to_string());
         if let Some(mut c) = engine.club_states.get_mut(&club_id) {

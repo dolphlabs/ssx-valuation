@@ -5,7 +5,7 @@
 //! caller's job (it needs a persisted api-player-id map, which lives in
 //! Redis on the `ssx-node` side, not here) - this module only knows what to
 //! do once that resolution has already happened.
-use crate::{ClubId, EngineUpdate, PlayerId, PlayerValues, Position, ValuationEngine};
+use crate::{transfer_impact, ClubId, EngineUpdate, PlayerId, PlayerValues, Position, ValuationEngine};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
@@ -125,16 +125,48 @@ pub struct TransferFact {
 
 const PLAYER_REBLEND_RETAIN: Decimal = dec!(0.5);
 const PLAYER_REBLEND_ADOPT: Decimal = dec!(0.5);
-const LOAN_DAMPING: Decimal = dec!(0.4);
 const NEW_SIGNING_DEFAULT_VALUE: Decimal = dec!(20.0); // fallback for a brand-new player with no fee signal (undisclosed/free/loan) - roughly a fringe-squad-player level in the backfilled data
-// No fee signal - same order of magnitude as a card, not a goal (see
-// process_event's Goal/RedCard/YellowCard handling in lib.rs, which uses
-// this same percent-of-current-value convention for the same reason: a
-// flat point value means the identical event is worth wildly different
-// relative amounts depending purely on a club's absolute valuation).
-const CLUB_FREE_OR_UNKNOWN_IMPACT_PCT: Decimal = dec!(0.05);
-
 impl ValuationEngine {
+    /// Each tracked active player at `club`, leaving out `exclude`.
+    fn squad_of(&self, club: ClubId, exclude: Option<PlayerId>) -> Vec<(PlayerId, Position, f64)> {
+        use rust_decimal::prelude::ToPrimitive;
+        self.player_states
+            .iter()
+            .filter(|e| e.value().active && e.value().team_id == club && Some(*e.key()) != exclude)
+            .map(|e| (*e.key(), e.value().position, e.value().intrinsic_value.to_f64().unwrap_or(0.0)))
+            .collect()
+    }
+
+    /// The seller's and buyer's percentage moves for `event`, from the
+    /// squads as they stand before the player moves (`transfer_impact`).
+    /// A player we never tracked at the seller stands in at the fee, or the
+    /// new-signing default, in his position bucket.
+    fn transfer_club_impacts(&self, event: &TransferEvent, fee: Option<Decimal>) -> (f64, f64) {
+        use rust_decimal::prelude::ToPrimitive;
+        let fee_f = fee.and_then(|f| f.to_f64());
+        let known = event.existing_player_id.and_then(|pid| self.player_states.get(&pid).map(|p| (pid, p.team_id, p.position, p.intrinsic_value.to_f64().unwrap_or(0.0))));
+        let position = known.map(|k| k.2).unwrap_or_else(|| event.position_bucket.representative_position());
+        let rating = known.map(|k| k.3).unwrap_or_else(|| fee_f.unwrap_or_else(|| NEW_SIGNING_DEFAULT_VALUE.to_f64().unwrap_or(20.0)));
+        let rating_after = match (known, fee_f) {
+            (Some(_), Some(f)) => rating * PLAYER_REBLEND_RETAIN.to_f64().unwrap_or(0.5) + f * PLAYER_REBLEND_ADOPT.to_f64().unwrap_or(0.5),
+            _ => rating,
+        };
+        let mv = transfer_impact::Move { position, rating, rating_after, fee: fee_f, loan: event.kind == TransferKind::Loan };
+        let moving = known.map(|k| k.0);
+
+        let seller = event.from.map(|from| {
+            let mut squad: Vec<(Position, f64)> = self.squad_of(from, moving).into_iter().map(|(_, p, r)| (p, r)).collect();
+            // He's at the seller in our records, or he's one we never tracked there.
+            squad.push((position, rating));
+            transfer_impact::seller_impact(&squad, squad.len() - 1, &mv)
+        });
+        let buyer = event.to.map(|to| {
+            let squad: Vec<(Position, f64)> = self.squad_of(to, moving).into_iter().map(|(_, p, r)| (p, r)).collect();
+            transfer_impact::buyer_impact(&squad, &mv)
+        });
+        (seller.unwrap_or(0.0), buyer.unwrap_or(0.0))
+    }
+
     /// Applies a confirmed transfer. Club-level effects fire independent of
     /// whether the player side resolves, mirroring `process_event`'s
     /// Goal/Card philosophy. Returns the `PlayerId` this transfer ended up
@@ -146,36 +178,15 @@ impl ValuationEngine {
             TransferKind::Permanent { fee } => fee,
             _ => None,
         };
-        let damping = if event.kind == TransferKind::Loan { LOAN_DAMPING } else { dec!(1.0) };
-
-        // A real fee is a real, absolute-currency signal (e.g. an actual
-        // €45m) and applies identically to both sides, same as before this
-        // change. The no-fee-signal fallback is a synthetic placeholder,
-        // not a real number - it's computed as a percent of *each side's
-        // own* current value rather than one shared flat number, since 5%
-        // of club A's value isn't 5% of club B's.
-        if let Some(to_club) = event.to {
-            if let Some(mut club) = self.club_states.get_mut(&to_club) {
-                let delta = match fee {
-                    Some(f) => f * damping,
-                    None => club.intrinsic_value * CLUB_FREE_OR_UNKNOWN_IMPACT_PCT * damping,
-                };
-                club.intrinsic_value += delta;
+        let (seller_pct, buyer_pct) = self.transfer_club_impacts(&event, fee);
+        for (club_id, pct) in [(event.from, seller_pct), (event.to, buyer_pct)] {
+            let Some(club_id) = club_id else { continue };
+            if let Some(mut club) = self.club_states.get_mut(&club_id) {
+                club.intrinsic_value *= Decimal::from_f64_retain(1.0 + pct).unwrap_or(Decimal::ONE);
+                club.transfer_ln += (1.0 + pct).ln();
                 club.last_match_update = current_ts;
                 club.anchor_resting_value();
-                self.notify(EngineUpdate::Club { id: to_club, state: club.clone(), ts: current_ts });
-            }
-        }
-        if let Some(from_club) = event.from {
-            if let Some(mut club) = self.club_states.get_mut(&from_club) {
-                let delta = match fee {
-                    Some(f) => f * damping,
-                    None => club.intrinsic_value * CLUB_FREE_OR_UNKNOWN_IMPACT_PCT * damping,
-                };
-                club.intrinsic_value -= delta;
-                club.last_match_update = current_ts;
-                club.anchor_resting_value();
-                self.notify(EngineUpdate::Club { id: from_club, state: club.clone(), ts: current_ts });
+                self.publish_club(&mut club, current_ts);
             }
         }
 
@@ -219,6 +230,8 @@ impl ValuationEngine {
                     position: event.position_bucket.representative_position(),
                     is_captain: false,
                     active: true,
+                    seed_value: Some(initial_value),
+                    injury_ln: 0.0,
                 };
                 self.player_states.insert(new_id, player.clone());
                 self.notify(EngineUpdate::Player { id: new_id, state: player });
@@ -260,6 +273,57 @@ mod tests {
         (engine, seller, buyer)
     }
 
+    /// A full XI at `level` for `club`, ids `club*1000 + n`.
+    fn add_squad(engine: &ValuationEngine, club: ClubId, level: Decimal) {
+        use Position::*;
+        for (n, position) in [GK, CB, CB, LB, RB, CDM, CM, CAM, ST, LW, RW].into_iter().enumerate() {
+            engine.player_states.insert(
+                PlayerId(club.0 * 1000 + n as u32),
+                PlayerValues {
+                    team_id: club,
+                    intrinsic_value: level,
+                    form_weight: dec!(1.0),
+                    sentiment_score: dec!(1.0),
+                    volatility_factor: dec!(1.0),
+                    performance_history: vec![level],
+                    position,
+                    is_captain: false,
+                    active: true,
+                    seed_value: None,
+                    injury_ln: 0.0,
+                },
+            );
+        }
+    }
+
+    /// Two clubs worth 100, each with an XI of 40s.
+    fn engine_with_two_squads() -> (ValuationEngine, ClubId, ClubId) {
+        let (engine, seller, buyer) = engine_with_two_clubs();
+        add_squad(&engine, seller, dec!(40));
+        add_squad(&engine, buyer, dec!(40));
+        (engine, seller, buyer)
+    }
+
+    fn star(team: ClubId, value: Decimal) -> PlayerValues {
+        PlayerValues {
+            team_id: team,
+            intrinsic_value: value,
+            form_weight: dec!(1.0),
+            sentiment_score: dec!(1.0),
+            volatility_factor: dec!(1.0),
+            performance_history: vec![value],
+            position: Position::ST,
+            is_captain: false,
+            active: true,
+            seed_value: None,
+            injury_ln: 0.0,
+        }
+    }
+
+    fn value(engine: &ValuationEngine, club: ClubId) -> Decimal {
+        engine.club_states.get(&club).unwrap().intrinsic_value
+    }
+
     #[test]
     fn fee_parsing_handles_millions_thousands_and_words() {
         assert_eq!(parse_transfer_kind("€45M"), TransferKind::Permanent { fee: Some(dec!(45)) });
@@ -293,7 +357,7 @@ mod tests {
 
     #[test]
     fn intra_universe_move_reassigns_club_and_reblends_value_toward_fee() {
-        let (engine, seller, buyer) = engine_with_two_clubs();
+        let (engine, seller, buyer) = engine_with_two_squads();
         let pid = PlayerId(100);
         engine.player_states.insert(
             pid,
@@ -307,6 +371,8 @@ mod tests {
                 position: Position::ST,
                 is_captain: false,
                 active: true,
+                seed_value: None,
+                injury_ln: 0.0,
             },
         );
 
@@ -333,7 +399,7 @@ mod tests {
 
     #[test]
     fn leaving_tracked_universe_deactivates_without_deleting() {
-        let (engine, seller, _buyer) = engine_with_two_clubs();
+        let (engine, seller, _buyer) = engine_with_two_squads();
         let pid = PlayerId(101);
         engine.player_states.insert(
             pid,
@@ -347,6 +413,8 @@ mod tests {
                 position: Position::ST,
                 is_captain: false,
                 active: true,
+                seed_value: None,
+                injury_ln: 0.0,
             },
         );
 
@@ -405,42 +473,88 @@ mod tests {
         assert_eq!(player.intrinsic_value, NEW_SIGNING_DEFAULT_VALUE);
     }
 
-    /// A no-fee-signal transfer's club-level impact must be a percentage of
-    /// *each side's own* current value, not one shared flat number split
-    /// between them - `engine_with_two_clubs` gives both sides an identical
-    /// starting value (100.0), which wouldn't have caught a regression to
-    /// the old shared-flat-delta behavior, so this test deliberately uses
-    /// two clubs of very different sizes instead.
     #[test]
-    fn no_fee_signal_impact_is_a_percentage_of_each_clubs_own_value() {
-        let engine = ValuationEngine::new();
-        let seller = ClubId(1);
-        let buyer = ClubId(2);
-        let mut seller_state = ClubState::new(seller);
-        seller_state.intrinsic_value = dec!(2250.0);
-        engine.club_states.insert(seller, seller_state);
-        let mut buyer_state = ClubState::new(buyer);
-        buyer_state.intrinsic_value = dec!(270.0);
-        engine.club_states.insert(buyer, buyer_state);
-
-        let event = TransferEvent {
-            existing_player_id: None,
-            player_name: "Unknown Fee Signing".into(),
-            position_bucket: PositionBucket::Def,
-            from: Some(seller),
-            to: Some(buyer),
-            kind: TransferKind::Free,
+    fn a_small_club_selling_its_star_loses_a_capped_share_and_a_good_fee_softens_it() {
+        let sell = |fee: Option<Decimal>| {
+            let (engine, seller, buyer) = engine_with_two_squads();
+            engine.player_states.insert(PlayerId(9), star(seller, dec!(90)));
+            engine.process_transfer(
+                TransferEvent {
+                    existing_player_id: Some(PlayerId(9)),
+                    player_name: "Star".into(),
+                    position_bucket: PositionBucket::Att,
+                    from: Some(seller),
+                    to: Some(buyer),
+                    kind: TransferKind::Permanent { fee },
+                },
+                0,
+            );
+            (value(&engine, seller), value(&engine, buyer))
         };
-        engine.process_transfer(event, 0);
+        let (undisclosed, _) = sell(None);
+        let (fair, _) = sell(Some(dec!(90)));
+        let (premium, buyer_after_premium) = sell(Some(dec!(180)));
+        assert!(undisclosed < dec!(100) && undisclosed >= dec!(75), "a sale is a percentage loss, capped at 25%: {undisclosed}");
+        assert_eq!(undisclosed, fair, "a fee equal to his rating is neither good nor bad business");
+        assert!(premium > fair && premium < dec!(100), "a big fee softens the loss but talent still wins: {premium}");
+        assert!(buyer_after_premium > dec!(100), "the buyer still gains a star, overpaying or not: {buyer_after_premium}");
+    }
 
-        let seller_after = engine.club_states.get(&seller).unwrap().intrinsic_value;
-        let buyer_after = engine.club_states.get(&buyer).unwrap().intrinsic_value;
+    #[test]
+    fn the_same_sale_moves_a_big_club_and_a_small_club_by_their_own_percentages() {
+        // Identical squads, values 2,250 and 270: both lose the same share.
+        let (engine, big, small) = engine_with_two_squads();
+        engine.club_states.get_mut(&big).unwrap().intrinsic_value = dec!(2250);
+        engine.club_states.get_mut(&small).unwrap().intrinsic_value = dec!(270);
+        for (club, pid) in [(big, 7001), (small, 7002)] {
+            engine.player_states.insert(PlayerId(pid), star(club, dec!(60)));
+            engine.process_transfer(
+                TransferEvent {
+                    existing_player_id: Some(PlayerId(pid)),
+                    player_name: "S".into(),
+                    position_bucket: PositionBucket::Att,
+                    from: Some(club),
+                    to: None,
+                    kind: TransferKind::Permanent { fee: Some(dec!(60)) },
+                },
+                0,
+            );
+        }
+        let big_pct = value(&engine, big) / dec!(2250);
+        let small_pct = value(&engine, small) / dec!(270);
+        assert!((big_pct - small_pct).abs() < dec!(0.000001), "{big_pct} vs {small_pct}");
+        assert!(big_pct < dec!(1));
+    }
 
-        // Each side moves by 5% of its *own* pre-transfer value - not a
-        // shared flat number (the old bug) and not 5% of the other side's
-        // value either.
-        assert_eq!(seller_after, dec!(2250.0) * (dec!(1) - dec!(0.05)), "seller should lose 5% of its own value, got {seller_after}");
-        assert_eq!(buyer_after, dec!(270.0) * (dec!(1) + dec!(0.05)), "buyer should gain 5% of its own value, got {buyer_after}");
+    #[test]
+    fn a_transfer_fades_on_its_own_slower_clock() {
+        let (engine, seller, _buyer) = engine_with_two_squads();
+        engine.club_states.get_mut(&seller).unwrap().anchor_value = Some(dec!(100));
+        engine.player_states.insert(PlayerId(9), star(seller, dec!(90)));
+        engine.process_transfer(
+            TransferEvent {
+                existing_player_id: Some(PlayerId(9)),
+                player_name: "Star".into(),
+                position_bucket: PositionBucket::Att,
+                from: Some(seller),
+                to: None,
+                kind: TransferKind::Permanent { fee: None },
+            },
+            0,
+        );
+        let after = value(&engine, seller);
+        let ln_move = engine.club_states.get(&seller).unwrap().transfer_ln;
+        assert!(ln_move < 0.0);
+
+        // The results clock alone leaves a transfer untouched...
+        engine.apply_result_fade(crate::ResultFade { keep: 0.5, ..crate::ResultFade::NONE });
+        assert!((value(&engine, seller) - after).abs() < dec!(0.0000001));
+        // ...its own clock halves it in log terms.
+        engine.apply_result_fade(crate::ResultFade { keep: 1.0, transfer_keep: 0.5 });
+        let club = engine.club_states.get(&seller).unwrap();
+        assert!((club.transfer_ln - ln_move / 2.0).abs() < 1e-12);
+        let expected = dec!(100) * Decimal::from_f64_retain((ln_move / 2.0).exp()).unwrap();
+        assert!((club.intrinsic_value - expected).abs() < dec!(0.0001), "{} vs {expected}", club.intrinsic_value);
     }
 
     #[test]
@@ -459,6 +573,8 @@ mod tests {
                 position: Position::CB,
                 is_captain: false,
                 active: false, // previously left our tracked universe
+                seed_value: None,
+                injury_ln: 0.0,
             },
         );
 
@@ -481,7 +597,7 @@ mod tests {
 
     #[test]
     fn loan_moves_are_damped_relative_to_permanent_moves() {
-        let (engine_permanent, seller, buyer) = engine_with_two_clubs();
+        let (engine_permanent, seller, buyer) = engine_with_two_squads();
         let pid = PlayerId(200);
         let make_player = || PlayerValues {
             team_id: seller,
@@ -493,6 +609,8 @@ mod tests {
             position: Position::ST,
             is_captain: false,
             active: true,
+            seed_value: None,
+            injury_ln: 0.0,
         };
         engine_permanent.player_states.insert(pid, make_player());
         engine_permanent.process_transfer(
@@ -508,7 +626,7 @@ mod tests {
         );
         let permanent_buyer_delta = engine_permanent.club_states.get(&buyer).unwrap().intrinsic_value - dec!(100.0);
 
-        let (engine_loan, seller2, buyer2) = engine_with_two_clubs();
+        let (engine_loan, seller2, buyer2) = engine_with_two_squads();
         engine_loan.player_states.insert(pid, make_player());
         engine_loan.process_transfer(
             TransferEvent {
